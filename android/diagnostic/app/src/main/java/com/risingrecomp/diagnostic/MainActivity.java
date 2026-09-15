@@ -112,7 +112,7 @@ public final class MainActivity extends Activity {
 
     private void runDiagnostics() {
         StringBuilder report = new StringBuilder();
-        report.append("RisingRecomp diagnostic 0.1.0\n");
+        report.append("RisingRecomp compatibility probe 0.2.0\n");
         report.append("Timestamp: ").append(new Date()).append('\n');
         report.append("Manufacturer: ").append(Build.MANUFACTURER).append('\n');
         report.append("Model: ").append(Build.MODEL).append('\n');

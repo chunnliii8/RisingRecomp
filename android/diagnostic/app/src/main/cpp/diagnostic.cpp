@@ -3,6 +3,9 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
+#include "null_ps_spv.h"
+#include "rt_factor_spv.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +28,384 @@ bool HasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
     return std::any_of(extensions.begin(), extensions.end(), [name](const auto& extension) {
         return std::string(extension.extensionName) == name;
     });
+}
+
+struct ProbeObjects {
+    VkDevice device = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView imageView = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule vertexShader = VK_NULL_HANDLE;
+    VkShaderModule fragmentShader = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+
+    ~ProbeObjects() {
+        if (device == VK_NULL_HANDLE) return;
+        vkDeviceWaitIdle(device);
+        if (fence) vkDestroyFence(device, fence, nullptr);
+        if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
+        if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+        if (fragmentShader) vkDestroyShaderModule(device, fragmentShader, nullptr);
+        if (vertexShader) vkDestroyShaderModule(device, vertexShader, nullptr);
+        if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        if (framebuffer) vkDestroyFramebuffer(device, framebuffer, nullptr);
+        if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
+        if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        if (descriptorLayout) vkDestroyDescriptorSetLayout(device, descriptorLayout, nullptr);
+        if (sampler) vkDestroySampler(device, sampler, nullptr);
+        if (imageView) vkDestroyImageView(device, imageView, nullptr);
+        if (image) vkDestroyImage(device, image, nullptr);
+        if (memory) vkFreeMemory(device, memory, nullptr);
+        vkDestroyDevice(device, nullptr);
+    }
+};
+
+uint32_t FindMemoryType(VkPhysicalDevice physicalDevice, uint32_t bits,
+                        VkMemoryPropertyFlags required) {
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &properties);
+    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+        if ((bits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & required) == required) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
+    std::ostringstream out;
+    out << "\n[Native Vulkan 1.1 compatibility path]\n";
+
+    uint32_t queueCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queues(queueCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queues.data());
+    uint32_t queueFamily = UINT32_MAX;
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            queueFamily = i;
+            break;
+        }
+    }
+    if (queueFamily == UINT32_MAX) return "No graphics queue: FAIL\n";
+
+    ProbeObjects objects;
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queueInfo{};
+    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueInfo.queueFamilyIndex = queueFamily;
+    queueInfo.queueCount = 1;
+    queueInfo.pQueuePriorities = &priority;
+    VkDeviceCreateInfo deviceInfo{};
+    deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceInfo.queueCreateInfoCount = 1;
+    deviceInfo.pQueueCreateInfos = &queueInfo;
+    VkResult result = vkCreateDevice(physicalDevice, &deviceInfo, nullptr, &objects.device);
+    out << "Vulkan 1.1 logical device: " << (result == VK_SUCCESS ? "PASS" : "FAIL")
+        << " (" << result << ")\n";
+    if (result != VK_SUCCESS) return out.str();
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent = {4, 4, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    result = vkCreateImage(objects.device, &imageInfo, nullptr, &objects.image);
+    if (result != VK_SUCCESS) {
+        out << "RGBA8 native image: FAIL (" << result << ")\n";
+        return out.str();
+    }
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(objects.device, objects.image, &requirements);
+    const uint32_t memoryType = FindMemoryType(
+            physicalDevice, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memoryType == UINT32_MAX) {
+        out << "RGBA8 native image memory: FAIL\n";
+        return out.str();
+    }
+    VkMemoryAllocateInfo allocation{};
+    allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memoryType;
+    result = vkAllocateMemory(objects.device, &allocation, nullptr, &objects.memory);
+    if (result == VK_SUCCESS) {
+        result = vkBindImageMemory(objects.device, objects.image, objects.memory, 0);
+    }
+    if (result != VK_SUCCESS) {
+        out << "RGBA8 native image memory: FAIL (" << result << ")\n";
+        return out.str();
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = objects.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    result = vkCreateImageView(objects.device, &viewInfo, nullptr, &objects.imageView);
+    out << "RGBA8 native image: " << (result == VK_SUCCESS ? "PASS" : "FAIL")
+        << " (" << result << ")\n";
+    if (result != VK_SUCCESS) return out.str();
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 1.0f;
+    result = vkCreateSampler(objects.device, &samplerInfo, nullptr, &objects.sampler);
+    if (result != VK_SUCCESS) {
+        out << "Fixed texture descriptor: FAIL (sampler " << result << ")\n";
+        return out.str();
+    }
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo descriptorInfo{};
+    descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    descriptorInfo.bindingCount = 1;
+    descriptorInfo.pBindings = &binding;
+    result = vkCreateDescriptorSetLayout(
+            objects.device, &descriptorInfo, nullptr, &objects.descriptorLayout);
+    if (result != VK_SUCCESS) {
+        out << "Fixed texture descriptor: FAIL (layout " << result << ")\n";
+        return out.str();
+    }
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    result = vkCreateDescriptorPool(objects.device, &poolInfo, nullptr, &objects.descriptorPool);
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    if (result == VK_SUCCESS) {
+        VkDescriptorSetAllocateInfo setInfo{};
+        setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        setInfo.descriptorPool = objects.descriptorPool;
+        setInfo.descriptorSetCount = 1;
+        setInfo.pSetLayouts = &objects.descriptorLayout;
+        result = vkAllocateDescriptorSets(objects.device, &setInfo, &descriptorSet);
+    }
+    if (result != VK_SUCCESS) {
+        out << "Fixed texture descriptor: FAIL (allocate " << result << ")\n";
+        return out.str();
+    }
+    VkDescriptorImageInfo descriptorImage{};
+    descriptorImage.sampler = objects.sampler;
+    descriptorImage.imageView = objects.imageView;
+    descriptorImage.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &descriptorImage;
+    vkUpdateDescriptorSets(objects.device, 1, &write, 0, nullptr);
+    out << "Fixed texture descriptor: PASS\n";
+
+    VkAttachmentDescription attachment{};
+    attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference colorReference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorReference;
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &attachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    result = vkCreateRenderPass(objects.device, &renderPassInfo, nullptr, &objects.renderPass);
+    if (result != VK_SUCCESS) {
+        out << "Classic render pass: FAIL (" << result << ")\n";
+        return out.str();
+    }
+    VkFramebufferCreateInfo framebufferInfo{};
+    framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebufferInfo.renderPass = objects.renderPass;
+    framebufferInfo.attachmentCount = 1;
+    framebufferInfo.pAttachments = &objects.imageView;
+    framebufferInfo.width = 4;
+    framebufferInfo.height = 4;
+    framebufferInfo.layers = 1;
+    result = vkCreateFramebuffer(objects.device, &framebufferInfo, nullptr, &objects.framebuffer);
+    out << "Classic render pass/framebuffer: "
+        << (result == VK_SUCCESS ? "PASS" : "FAIL") << " (" << result << ")\n";
+    if (result != VK_SUCCESS) return out.str();
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &objects.descriptorLayout;
+    result = vkCreatePipelineLayout(objects.device, &layoutInfo, nullptr, &objects.pipelineLayout);
+    if (result != VK_SUCCESS) {
+        out << "SPIR-V pipeline without Int64: FAIL (layout " << result << ")\n";
+        return out.str();
+    }
+
+    std::vector<uint32_t> vertexSpv(std::begin(kRtFactorVsSpv), std::end(kRtFactorVsSpv));
+    vertexSpv[1] = 0x00010000;  // Basic instructions only; advertise SPIR-V 1.0 for Vulkan 1.1.
+    VkShaderModuleCreateInfo shaderInfo{};
+    shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderInfo.codeSize = vertexSpv.size() * sizeof(uint32_t);
+    shaderInfo.pCode = vertexSpv.data();
+    result = vkCreateShaderModule(objects.device, &shaderInfo, nullptr, &objects.vertexShader);
+    if (result == VK_SUCCESS) {
+        shaderInfo.codeSize = sizeof(kNullPixelShaderSpv);
+        shaderInfo.pCode = kNullPixelShaderSpv;
+        result = vkCreateShaderModule(objects.device, &shaderInfo, nullptr, &objects.fragmentShader);
+    }
+    if (result != VK_SUCCESS) {
+        out << "SPIR-V pipeline without Int64: FAIL (shader " << result << ")\n";
+        return out.str();
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = objects.vertexShader;
+    stages[0].pName = "vsMain";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = objects.fragmentShader;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo assembly{};
+    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport viewport{0, 0, 4, 4, 0, 1};
+    VkRect2D scissor{{0, 0}, {4, 4}};
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = &scissor;
+    VkPipelineRasterizationStateCreateInfo rasterization{};
+    rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blendAttachment;
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = stages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &assembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pColorBlendState = &blend;
+    pipelineInfo.layout = objects.pipelineLayout;
+    pipelineInfo.renderPass = objects.renderPass;
+    result = vkCreateGraphicsPipelines(
+            objects.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &objects.pipeline);
+    out << "SPIR-V pipeline without Int64: "
+        << (result == VK_SUCCESS ? "PASS" : "FAIL") << " (" << result << ")\n";
+    if (result != VK_SUCCESS) return out.str();
+
+    VkCommandPoolCreateInfo commandPoolInfo{};
+    commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    commandPoolInfo.queueFamilyIndex = queueFamily;
+    result = vkCreateCommandPool(objects.device, &commandPoolInfo, nullptr, &objects.commandPool);
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    if (result == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo commandInfo{};
+        commandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        commandInfo.commandPool = objects.commandPool;
+        commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandInfo.commandBufferCount = 1;
+        result = vkAllocateCommandBuffers(objects.device, &commandInfo, &commandBuffer);
+    }
+    if (result != VK_SUCCESS) {
+        out << "Offscreen native draw: FAIL (command " << result << ")\n";
+        return out.str();
+    }
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    VkClearValue clear{};
+    clear.color = {{0.08f, 0.18f, 0.35f, 1.0f}};
+    VkRenderPassBeginInfo passBegin{};
+    passBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    passBegin.renderPass = objects.renderPass;
+    passBegin.framebuffer = objects.framebuffer;
+    passBegin.renderArea.extent = {4, 4};
+    passBegin.clearValueCount = 1;
+    passBegin.pClearValues = &clear;
+    if (result == VK_SUCCESS) {
+        vkCmdBeginRenderPass(commandBuffer, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, objects.pipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                objects.pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        vkCmdEndRenderPass(commandBuffer);
+        result = vkEndCommandBuffer(commandBuffer);
+    }
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (result == VK_SUCCESS) {
+        result = vkCreateFence(objects.device, &fenceInfo, nullptr, &objects.fence);
+    }
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(objects.device, queueFamily, 0, &queue);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commandBuffer;
+    if (result == VK_SUCCESS) result = vkQueueSubmit(queue, 1, &submit, objects.fence);
+    if (result == VK_SUCCESS) {
+        result = vkWaitForFences(objects.device, 1, &objects.fence, VK_TRUE, 5000000000ULL);
+    }
+    out << "Offscreen native draw + fence: "
+        << (result == VK_SUCCESS ? "PASS" : "FAIL") << " (" << result << ")\n";
+    out << "Compatibility probe: " << (result == VK_SUCCESS ? "PASS" : "FAIL") << '\n';
+    return out.str();
 }
 
 std::string Collect() {
@@ -144,6 +525,7 @@ std::string Collect() {
                 && features13.dynamicRendering;
         out << "Current renderer requirements: "
             << (rendererReady ? "PASS" : "FAIL (adaptation required)") << '\n';
+        out << RunCompatibilityProbe(devices[index]);
     }
 
     vkDestroyInstance(instance, nullptr);

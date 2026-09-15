@@ -42,6 +42,6 @@ jobs:
       - name: Upload diagnostic APK
         uses: actions/upload-artifact@v4
         with:
-          name: RisingRecomp-Diagnostic-v0.1.0
+          name: RisingRecomp-Compatibility-Probe-v0.2.0
           path: android/diagnostic/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

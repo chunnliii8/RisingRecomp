@@ -848,6 +848,41 @@ static bool LowerCompatibilityConstants(std::string& hlsl, std::string& err)
     return true;
 }
 
+static bool SeparateCompatibilityConstantSet(std::string& hlsl, std::string& err)
+{
+    // Texture1D already owns t0/space4.  Unlike D3D, Vulkan does not give the t/b/s
+    // register classes separate binding namespaces, so leaving the fallback cbuffer
+    // at b0/space4 would make DXC emit two resources at set 4, binding 0.  Put the
+    // per-stage constant buffer in its own set while preserving b0 for VS and b1 for
+    // PS.  The renderer compatibility layout can consequently expose both bindings
+    // in set 5 without changing the modern five-set ABI.
+    const std::string marker = "ShaderConstants : register(b";
+    const std::string from = ", space4)";
+    const std::string to = ", space5)";
+    const size_t nameAt = hlsl.find(marker);
+    if (nameAt == std::string::npos)
+    {
+        err = "Vulkan 1.1 constant-set lowering found no shader cbuffer";
+        return false;
+    }
+    const size_t spaceAt = hlsl.find(from, nameAt + marker.size());
+    if (spaceAt == std::string::npos)
+    {
+        err = "Vulkan 1.1 shader cbuffer was not in register space4";
+        return false;
+    }
+    hlsl.replace(spaceAt, from.size(), to);
+
+    // One generated module contains exactly one stage cbuffer.  Refuse ambiguous
+    // emitter output rather than accidentally moving an unrelated resource.
+    if (hlsl.find(marker, nameAt + marker.size()) != std::string::npos)
+    {
+        err = "Vulkan 1.1 constant-set lowering found multiple shader cbuffers";
+        return false;
+    }
+    return true;
+}
+
 static bool LowerCompatibilityDescriptors(std::string& hlsl, std::string& err)
 {
     // Xenos addresses at most 32 texture-fetch constants.  A fixed array indexed by
@@ -1053,6 +1088,8 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
     if (profile == Profile::Vulkan11Compatibility)
     {
         if (!LowerCompatibilityConstants(out.hlsl, err))
+            return false;
+        if (!SeparateCompatibilityConstantSet(out.hlsl, err))
             return false;
         if (!LowerCompatibilityDescriptors(out.hlsl, err))
             return false;

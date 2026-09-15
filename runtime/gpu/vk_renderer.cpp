@@ -7277,6 +7277,44 @@ static VkFormat PickEdramDepthFormat(VkPhysicalDevice phys, bool* d24Sampleable)
     return ok ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
 }
 
+static bool FormatSupports(VkPhysicalDevice phys, VkFormat format,
+                           VkFormatFeatureFlags required)
+{
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(phys, format, &fp);
+    return (fp.optimalTilingFeatures & required) == required;
+}
+
+static VkFormat PickCompatibilityEdramDepthFormat(VkPhysicalDevice phys)
+{
+    const VkFormatFeatureFlags required =
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormat preferred[] = {
+        VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT
+    };
+    for (VkFormat format : preferred)
+        if (FormatSupports(phys, format, required))
+            return format;
+    return VK_FORMAT_UNDEFINED;
+}
+
+static void EvaluateCompatibilityFormats(VkPhysicalDevice phys,
+                                         std::vector<std::string>& missing)
+{
+    const VkFormatFeatureFlags colorRequired =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if (!FormatSupports(phys, VK_FORMAT_R8G8B8A8_UNORM, colorRequired))
+        missing.emplace_back("R8G8B8A8_UNORM attachment/sample/transfer support");
+    if (PickCompatibilityEdramDepthFormat(phys) == VK_FORMAT_UNDEFINED)
+        missing.emplace_back("sampleable depth-stencil attachment with transfer support");
+}
+
 void ChooseEdramDepthFormat(VkPhysicalDevice phys)
 {
     if (EnvOn("CZ_VK_DEPTH_FLOAT"))
@@ -8268,6 +8306,8 @@ bool CreateDevice()
                              /*listAll=*/false, profile);
         std::vector<std::string> missingLimits;
         EvaluateCompatibilityLimits(caps, missingLimits);
+        std::vector<std::string> missingFormats;
+        EvaluateCompatibilityFormats(R->physical, missingFormats);
         if (!missing.empty())
         {
             fprintf(stderr, "[vk] Vulkan 1.1 compatibility baseline is missing:");
@@ -8281,6 +8321,20 @@ bool CreateDevice()
             for (const std::string& m : missingLimits)
                 fprintf(stderr, " %s", m.c_str());
             fprintf(stderr, "\n");
+        }
+        if (!missingFormats.empty())
+        {
+            fprintf(stderr, "[vk] Vulkan 1.1 compatibility formats are missing:");
+            for (const std::string& m : missingFormats)
+                fprintf(stderr, " %s", m.c_str());
+            fprintf(stderr, "\n");
+        }
+        else
+        {
+            g_edramDepthFormat = PickCompatibilityEdramDepthFormat(R->physical);
+            fprintf(stderr, "[vk] Vulkan 1.1 compatibility EDRAM depth format: %s\n",
+                    g_edramDepthFormat == VK_FORMAT_D24_UNORM_S8_UINT
+                        ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT");
         }
         fprintf(stderr, "[vk] Vulkan 1.1 compatibility gate remains CLOSED: device creation "
                         "is intentionally deferred until the full Etapa 1 chain is reviewed.\n");
@@ -9460,10 +9514,12 @@ bool LoadShaders()
     // Modern and Vulkan 1.1 modules have different descriptor/constant ABIs and must
     // never share a cache.  Keep the released cache exactly where it is; compatibility
     // modules live below it and are produced lazily from the guest microcode on first
-    // bind until a dedicated mobile prebuild is added.
+    // bind until a dedicated mobile prebuild is added. The suffix is an ABI version:
+    // vk11 contained the earlier six-set layout and must never be loaded by the compact
+    // two-set pipeline layout even though both are valid Vulkan 1.1 SPIR-V.
     if (R->compatibilityProfile)
     {
-        dir /= "vk11";
+        dir /= "vk11_abi2";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         if (ec)
@@ -25131,9 +25187,16 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                     CompatibilityTextureView(regs, constIdx, dim, slot);
                 imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 VkDescriptorImageInfo samplerInfo{};
-                samplerInfo.sampler = samplerSlot < R->samplerHandles.size()
-                                          ? R->samplerHandles[samplerSlot]
-                                          : R->linearSampler;
+                const xenos::TextureFetch compatibilityFetch =
+                    xenos::DecodeTextureFetch(regs, constIdx);
+                const bool depthFetch = compatibilityFetch.format == xenos::kFmt_24_8 ||
+                                        compatibilityFetch.format == xenos::kFmt_24_8_FLOAT;
+                // Linear filtering of depth formats is optional in Vulkan 1.1. Point
+                // sampling keeps snapshot reads valid without turning a mobile-format
+                // option into another compatibility feature requirement.
+                samplerInfo.sampler = depthFetch ? R->pointSampler
+                    : samplerSlot < R->samplerHandles.size()
+                        ? R->samplerHandles[samplerSlot] : R->linearSampler;
                 VkWriteDescriptorSet writes[2]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                 writes[0].dstSet = compatDrawSets[0];
@@ -34608,6 +34671,18 @@ bool VkRenderer_Diag()
             {
                 fprintf(stderr, "%s   compatibility descriptor limits missing:", T);
                 for (const std::string& m : missingLimits)
+                    fprintf(stderr, " %s", m.c_str());
+                fprintf(stderr, "\n");
+                ok = false;
+            }
+            std::vector<std::string> missingFormats;
+            EvaluateCompatibilityFormats(devices[i], missingFormats);
+            if (missingFormats.empty())
+                fprintf(stderr, "%s   compatibility EDRAM formats: present\n", T);
+            else
+            {
+                fprintf(stderr, "%s   compatibility formats missing:", T);
+                for (const std::string& m : missingFormats)
                     fprintf(stderr, " %s", m.c_str());
                 fprintf(stderr, "\n");
                 ok = false;

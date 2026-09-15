@@ -1,0 +1,48 @@
+name: Android runtime bootstrap APK
+
+on:
+  push:
+    branches:
+      - risingRecomp
+    paths:
+      - "android/runtime/**"
+      - ".github/workflows/android-runtime-bootstrap.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build ARM64 runtime bootstrap APK
+        working-directory: android/runtime
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify native runtime library
+        run: |
+          test -s android/runtime/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l android/runtime/app/build/outputs/apk/debug/app-debug.apk | grep \
+            'lib/arm64-v8a/librising_runtime_bootstrap.so'
+
+      - name: Upload runtime bootstrap APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisingRecomp-Runtime-Bootstrap-v0.1.0
+          path: android/runtime/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

@@ -1,0 +1,34 @@
+name: Bootstrap upstream source
+
+on:
+  push:
+    branches:
+      - risingRecomp
+    paths:
+      - .github/workflows/bootstrap-upstream.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    if: github.event.head_commit.message == 'Bootstrap upstream source'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out RisingRecomp
+        uses: actions/checkout@v4
+        with:
+          ref: risingRecomp
+          fetch-depth: 1
+
+      - name: Import source at repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch master https://github.com/wivi514/Dead_Rising_2_Case_Zero_Xenon_Recomp.git /tmp/case-zero-upstream
+          rsync -a --exclude='.git' /tmp/case-zero-upstream/ ./
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Import Dead Rising 2 Case Zero Xenon Recomp source"
+          git push origin HEAD:risingRecomp

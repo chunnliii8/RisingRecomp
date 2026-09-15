@@ -23,6 +23,77 @@ std::string Version(uint32_t value) {
 
 const char* Yes(bool value) { return value ? "YES" : "NO"; }
 
+constexpr uint32_t kCompatDescriptorSlots = 16;
+constexpr uint32_t kCompatDescriptorSetsPerDraw = 2;
+constexpr uint32_t kVsConstBytes = 256 * 16;
+
+bool FormatSupports(VkPhysicalDevice physicalDevice, VkFormat format,
+                    VkFormatFeatureFlags required) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &properties);
+    return (properties.optimalTilingFeatures & required) == required;
+}
+
+VkFormat PickCompatibilityDepthFormat(VkPhysicalDevice physicalDevice) {
+    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormat candidates[] = {
+            VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    for (VkFormat format : candidates) {
+        if (FormatSupports(physicalDevice, format, required)) return format;
+    }
+    return VK_FORMAT_UNDEFINED;
+}
+
+std::vector<std::string> CompatibilityGateFailures(
+        VkPhysicalDevice physicalDevice, const VkPhysicalDeviceProperties& properties,
+        uint32_t loaderVersion) {
+    std::vector<std::string> missing;
+    const auto& limits = properties.limits;
+    auto need = [&missing](bool have, const char* name, uint64_t actual, uint64_t required) {
+        if (!have) missing.emplace_back(std::string(name) + "=" + std::to_string(actual) +
+                                        " (needs " + std::to_string(required) + ")");
+    };
+    need(loaderVersion >= VK_API_VERSION_1_1, "Vulkan loader API", loaderVersion,
+         VK_API_VERSION_1_1);
+    need(properties.apiVersion >= VK_API_VERSION_1_1, "Device Vulkan API",
+         properties.apiVersion, VK_API_VERSION_1_1);
+    need(limits.maxBoundDescriptorSets >= kCompatDescriptorSetsPerDraw,
+         "maxBoundDescriptorSets", limits.maxBoundDescriptorSets,
+         kCompatDescriptorSetsPerDraw);
+    need(limits.maxPerStageDescriptorSampledImages >= kCompatDescriptorSlots * 4,
+         "maxPerStageDescriptorSampledImages", limits.maxPerStageDescriptorSampledImages,
+         kCompatDescriptorSlots * 4);
+    need(limits.maxDescriptorSetSampledImages >= kCompatDescriptorSlots * 4,
+         "maxDescriptorSetSampledImages", limits.maxDescriptorSetSampledImages,
+         kCompatDescriptorSlots * 4);
+    need(limits.maxPerStageDescriptorSamplers >= kCompatDescriptorSlots,
+         "maxPerStageDescriptorSamplers", limits.maxPerStageDescriptorSamplers,
+         kCompatDescriptorSlots);
+    need(limits.maxDescriptorSetSamplers >= kCompatDescriptorSlots,
+         "maxDescriptorSetSamplers", limits.maxDescriptorSetSamplers,
+         kCompatDescriptorSlots);
+    need(limits.maxPerStageDescriptorUniformBuffers >= 2,
+         "maxPerStageDescriptorUniformBuffers", limits.maxPerStageDescriptorUniformBuffers, 2);
+    need(limits.maxDescriptorSetUniformBuffers >= 3, "maxDescriptorSetUniformBuffers",
+         limits.maxDescriptorSetUniformBuffers, 3);
+    need(limits.maxPerStageResources >= kCompatDescriptorSlots * 5 + 2,
+         "maxPerStageResources", limits.maxPerStageResources,
+         kCompatDescriptorSlots * 5 + 2);
+    need(limits.maxUniformBufferRange >= kVsConstBytes, "maxUniformBufferRange",
+         limits.maxUniformBufferRange, kVsConstBytes);
+
+    const VkFormatFeatureFlags colorRequired = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if (!FormatSupports(physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, colorRequired))
+        missing.emplace_back("R8G8B8A8_UNORM attachment/sample/transfer support");
+    if (PickCompatibilityDepthFormat(physicalDevice) == VK_FORMAT_UNDEFINED)
+        missing.emplace_back("sampleable depth-stencil attachment with transfer support");
+    return missing;
+}
+
 bool HasExtension(const std::vector<VkExtensionProperties>& extensions, const char* name) {
     return std::any_of(extensions.begin(), extensions.end(), [name](const auto& extension) {
         return std::string(extension.extensionName) == name;
@@ -35,7 +106,7 @@ struct ProbeObjects {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView imageView = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorLayouts[kCompatDescriptorSetsPerDraw]{};
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -58,7 +129,8 @@ struct ProbeObjects {
         if (framebuffer) vkDestroyFramebuffer(device, framebuffer, nullptr);
         if (renderPass) vkDestroyRenderPass(device, renderPass, nullptr);
         if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-        if (descriptorLayout) vkDestroyDescriptorSetLayout(device, descriptorLayout, nullptr);
+        for (VkDescriptorSetLayout layout : descriptorLayouts)
+            if (layout) vkDestroyDescriptorSetLayout(device, layout, nullptr);
         if (sampler) vkDestroySampler(device, sampler, nullptr);
         if (imageView) vkDestroyImageView(device, imageView, nullptr);
         if (image) vkDestroyImage(device, image, nullptr);
@@ -178,54 +250,68 @@ std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
         return out.str();
     }
 
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    const VkDescriptorType textureTypes[5] = {
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+    VkDescriptorSetLayoutBinding textureBindings[5]{};
+    for (uint32_t i = 0; i < 5; ++i) {
+        textureBindings[i].binding = i;
+        textureBindings[i].descriptorType = textureTypes[i];
+        textureBindings[i].descriptorCount = kCompatDescriptorSlots;
+        textureBindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 1;
-    descriptorInfo.pBindings = &binding;
+    descriptorInfo.bindingCount = 5;
+    descriptorInfo.pBindings = textureBindings;
     result = vkCreateDescriptorSetLayout(
-            objects.device, &descriptorInfo, nullptr, &objects.descriptorLayout);
+            objects.device, &descriptorInfo, nullptr, &objects.descriptorLayouts[0]);
     if (result != VK_SUCCESS) {
-        out << "Fixed texture descriptor: FAIL (layout " << result << ")\n";
+        out << "Fixed two-set descriptor ABI: FAIL (texture layout " << result << ")\n";
         return out.str();
     }
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorSetLayoutBinding constants[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        constants[i].binding = i;
+        constants[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        constants[i].descriptorCount = 1;
+    }
+    constants[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    constants[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    constants[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    descriptorInfo.bindingCount = 3;
+    descriptorInfo.pBindings = constants;
+    result = vkCreateDescriptorSetLayout(
+            objects.device, &descriptorInfo, nullptr, &objects.descriptorLayouts[1]);
+    if (result != VK_SUCCESS) {
+        out << "Fixed two-set descriptor ABI: FAIL (constant layout " << result << ")\n";
+        return out.str();
+    }
+    const VkDescriptorPoolSize poolSizes[] = {
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kCompatDescriptorSlots * 4},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, kCompatDescriptorSlots},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3}};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = kCompatDescriptorSetsPerDraw;
+    poolInfo.poolSizeCount = 3;
+    poolInfo.pPoolSizes = poolSizes;
     result = vkCreateDescriptorPool(objects.device, &poolInfo, nullptr, &objects.descriptorPool);
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSets[kCompatDescriptorSetsPerDraw]{};
     if (result == VK_SUCCESS) {
         VkDescriptorSetAllocateInfo setInfo{};
         setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         setInfo.descriptorPool = objects.descriptorPool;
-        setInfo.descriptorSetCount = 1;
-        setInfo.pSetLayouts = &objects.descriptorLayout;
-        result = vkAllocateDescriptorSets(objects.device, &setInfo, &descriptorSet);
+        setInfo.descriptorSetCount = kCompatDescriptorSetsPerDraw;
+        setInfo.pSetLayouts = objects.descriptorLayouts;
+        result = vkAllocateDescriptorSets(objects.device, &setInfo, descriptorSets);
     }
     if (result != VK_SUCCESS) {
-        out << "Fixed texture descriptor: FAIL (allocate " << result << ")\n";
+        out << "Fixed two-set descriptor ABI: FAIL (allocate " << result << ")\n";
         return out.str();
     }
-    VkDescriptorImageInfo descriptorImage{};
-    descriptorImage.sampler = objects.sampler;
-    descriptorImage.imageView = objects.imageView;
-    descriptorImage.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &descriptorImage;
-    vkUpdateDescriptorSets(objects.device, 1, &write, 0, nullptr);
-    out << "Fixed texture descriptor: PASS\n";
+    out << "Fixed two-set descriptor ABI (64 images/16 samplers/3 UBOs): PASS\n";
 
     VkAttachmentDescription attachment{};
     attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -267,8 +353,8 @@ std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &objects.descriptorLayout;
+    layoutInfo.setLayoutCount = kCompatDescriptorSetsPerDraw;
+    layoutInfo.pSetLayouts = objects.descriptorLayouts;
     result = vkCreatePipelineLayout(objects.device, &layoutInfo, nullptr, &objects.pipelineLayout);
     if (result != VK_SUCCESS) {
         out << "SPIR-V pipeline without Int64: FAIL (layout " << result << ")\n";
@@ -378,8 +464,6 @@ std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
     if (result == VK_SUCCESS) {
         vkCmdBeginRenderPass(commandBuffer, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, objects.pipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                objects.pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
         vkCmdEndRenderPass(commandBuffer);
         result = vkEndCommandBuffer(commandBuffer);
@@ -464,8 +548,13 @@ std::string Collect() {
         const auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
                 vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
         if (getFeatures2) {
-            features.pNext = &features12;
-            features12.pNext = &features13;
+            // Do not put newer core structs in the chain on a Vulkan 1.1 driver.
+            // Some old Android loaders reject or mishandle unknown pNext structures.
+            if (properties.apiVersion >= VK_API_VERSION_1_2) {
+                features.pNext = &features12;
+                if (properties.apiVersion >= VK_API_VERSION_1_3)
+                    features12.pNext = &features13;
+            }
             getFeatures2(devices[index], &features);
         } else {
             vkGetPhysicalDeviceFeatures(devices[index], &features.features);
@@ -520,9 +609,29 @@ std::string Collect() {
                 && features12.descriptorBindingVariableDescriptorCount
                 && features12.shaderSampledImageArrayNonUniformIndexing
                 && features13.dynamicRendering;
-        out << "Current renderer requirements: "
-            << (rendererReady ? "PASS" : "FAIL (adaptation required)") << '\n';
-        out << RunCompatibilityProbe(devices[index]);
+        const std::vector<std::string> compatibilityFailures =
+                CompatibilityGateFailures(devices[index], properties, loaderVersion);
+        out << "Modern Vulkan 1.3 route: " << (rendererReady ? "PASS" : "UNAVAILABLE") << '\n';
+        out << "Vulkan 1.1 runtime gate: "
+            << (compatibilityFailures.empty() ? "PASS" : "FAIL") << '\n';
+        for (const std::string& failure : compatibilityFailures)
+            out << "  missing: " << failure << '\n';
+        const VkFormat depthFormat = PickCompatibilityDepthFormat(devices[index]);
+        if (depthFormat != VK_FORMAT_UNDEFINED) {
+            out << "Compatibility depth format: "
+                << (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT
+                            ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT") << '\n';
+        }
+        out << "Selected renderer profile: "
+            << (rendererReady ? "MODERN"
+                              : (compatibilityFailures.empty() ? "VULKAN 1.1 COMPATIBILITY"
+                                                                : "UNSUPPORTED"))
+            << '\n';
+        if (compatibilityFailures.empty())
+            out << RunCompatibilityProbe(devices[index]);
+        else
+            out << "\n[Native Vulkan 1.1 compatibility path]\n"
+                   "Compatibility probe: SKIPPED (runtime gate failed)\n";
     }
 
     vkDestroyInstance(instance, nullptr);

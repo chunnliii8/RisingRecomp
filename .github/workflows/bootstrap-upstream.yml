@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   import:
-    if: github.event.head_commit.message == 'Bootstrap upstream source'
+    if: startsWith(github.event.head_commit.message, 'Bootstrap upstream source')
     runs-on: ubuntu-latest
     steps:
       - name: Check out RisingRecomp
@@ -26,7 +26,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch master https://github.com/wivi514/Dead_Rising_2_Case_Zero_Xenon_Recomp.git /tmp/case-zero-upstream
-          rsync -a --exclude='.git' /tmp/case-zero-upstream/ ./
+          rsync -a --exclude='.git' --exclude='.github/workflows/' /tmp/case-zero-upstream/ ./
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A

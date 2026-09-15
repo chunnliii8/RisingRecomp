@@ -5594,6 +5594,9 @@ struct Renderer
     // Set by capability classification. It remains false for the released modern
     // route; the Vulkan 1.1 bring-up gate is intentionally still closed below.
     bool compatibilityProfile = false;
+    // Only the compatibility route may replace unsupported BC images with CPU-decoded
+    // RGBA8. Modern keeps its native compressed upload byte-for-byte.
+    bool compatibilityDecodeBc = false;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayouts[6]{};
     VkDescriptorSet sets[6]{};
@@ -8204,20 +8207,23 @@ bool CreateDevice()
         BugReport_SetGpu(caps.props.deviceName, drv, caps.props.apiVersion);
     }
     const RendererProfile profile = ClassifyRendererProfile(caps);
+    // Build a feature request for exactly one renderer contract. The Vulkan 1.2/1.3
+    // structs are chained only for Modern; a future compatibility-device creation will
+    // submit a plain Vulkan 1.1 features2 request with no modern structs attached.
+    VkPhysicalDeviceVulkan12Features v12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    };
+    VkPhysicalDeviceVulkan13Features v13{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+    };
+    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     if (profile == RendererProfile::CompatibilityCandidate)
     {
         // This deliberately exercises only the CompatibilityCandidate contract.  It
         // must never be rejected for a Modern feature while Etapa 1 is being audited,
         // and it must not create a device until the remaining chain has been reviewed.
-        VkPhysicalDeviceFeatures2 compatF2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-        VkPhysicalDeviceVulkan12Features unused12{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
-        };
-        VkPhysicalDeviceVulkan13Features unused13{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
-        };
         std::vector<const char*> missing;
-        EvaluateRequirements(caps, compatF2, unused12, unused13, missing, "[vk]",
+        EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]",
                              /*listAll=*/false, profile);
         if (!missing.empty())
         {
@@ -8230,48 +8236,44 @@ bool CreateDevice()
                         "is intentionally deferred until the full Etapa 1 chain is reviewed.\n");
         return false;
     }
-    if (caps.props.apiVersion < VK_API_VERSION_1_3)
+    else
     {
-        fprintf(stderr, "[vk] this device reports Vulkan %u.%u.%u and the renderer needs "
-                        "1.3 (dynamic rendering, the 1.2 descriptor-indexing set). A newer "
-                        "driver is the only fix; running without a renderer.\n",
-                VK_VERSION_MAJOR(caps.props.apiVersion),
-                VK_VERSION_MINOR(caps.props.apiVersion),
-                VK_VERSION_PATCH(caps.props.apiVersion));
-        return false;
-    }
-    VkPhysicalDeviceVulkan12Features v12{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
-    };
-    VkPhysicalDeviceVulkan13Features v13{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
-    };
-    v13.pNext = &v12;
-    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    f2.pNext = &v13;
-    {
-        std::vector<const char*> missing;
-        EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]", /*listAll=*/false,
-                             RendererProfile::Modern);
-        if (!missing.empty())
+        if (caps.props.apiVersion < VK_API_VERSION_1_3)
         {
-            std::string list;
-            for (const char* m : missing)
-                list += std::string(list.empty() ? "" : ", ") + m;
-            fprintf(stderr, "[vk] THIS DEVICE CANNOT RUN THE RENDERER — missing REQUIRED "
-                            "Vulkan feature%s: %s (device %s, %s). `cz_runtime --diag` "
-                            "prints the whole table; running without a renderer.\n",
-                    missing.size() == 1 ? "" : "s", list.c_str(), caps.props.deviceName,
-                    caps.haveDriverProps ? caps.driver.driverInfo : "driver unknown");
+            fprintf(stderr, "[vk] this device reports Vulkan %u.%u.%u and the renderer needs "
+                            "1.3 (dynamic rendering, the 1.2 descriptor-indexing set). A newer "
+                            "driver is the only fix; running without a renderer.\n",
+                    VK_VERSION_MAJOR(caps.props.apiVersion),
+                    VK_VERSION_MINOR(caps.props.apiVersion),
+                    VK_VERSION_PATCH(caps.props.apiVersion));
             return false;
         }
-        // ANISOTROPIC FILTERING (part 41 item 1). Xenos filters up to 16:1 and the
-        // fetch constants carry a per-texture aniso field; the sampler decides whether
-        // to USE it (CZ_VK_NO_ANISO acts there). The limit is read here because the
-        // table only says present/absent.
-        if (f2.features.samplerAnisotropy)
-            R->anisoLimit = props.limits.maxSamplerAnisotropy;
-        R->pipeStats = f2.features.pipelineStatisticsQuery == VK_TRUE;
+        v13.pNext = &v12;
+        f2.pNext = &v13;
+        {
+            std::vector<const char*> missing;
+            EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]", /*listAll=*/false,
+                                 RendererProfile::Modern);
+            if (!missing.empty())
+            {
+                std::string list;
+                for (const char* m : missing)
+                    list += std::string(list.empty() ? "" : ", ") + m;
+                fprintf(stderr, "[vk] THIS DEVICE CANNOT RUN THE RENDERER — missing REQUIRED "
+                                "Vulkan feature%s: %s (device %s, %s). `cz_runtime --diag` "
+                                "prints the whole table; running without a renderer.\n",
+                        missing.size() == 1 ? "" : "s", list.c_str(), caps.props.deviceName,
+                        caps.haveDriverProps ? caps.driver.driverInfo : "driver unknown");
+                return false;
+            }
+            // ANISOTROPIC FILTERING (part 41 item 1). Xenos filters up to 16:1 and the
+            // fetch constants carry a per-texture aniso field; the sampler decides whether
+            // to USE it (CZ_VK_NO_ANISO acts there). The limit is read here because the
+            // table only says present/absent.
+            if (f2.features.samplerAnisotropy)
+                R->anisoLimit = props.limits.maxSamplerAnisotropy;
+            R->pipeStats = f2.features.pipelineStatisticsQuery == VK_TRUE;
+        }
     }
 
     // RT STAGE 2 (part 64): act on stage 0's probe. See the rtEnabled comment in the
@@ -10056,6 +10058,167 @@ VkFormat XenosTextureFormat(uint32_t fmt, uint32_t& bytesPerUnit, uint32_t& bloc
     }
 }
 
+static uint8_t Expand5(uint32_t v) { return uint8_t((v << 3) | (v >> 2)); }
+static uint8_t Expand6(uint32_t v) { return uint8_t((v << 2) | (v >> 4)); }
+
+static void DecodeBcColour(const uint8_t* block, bool forceFourColour,
+                           uint8_t rgba[16][4])
+{
+    const uint16_t c0 = uint16_t(block[0]) | uint16_t(block[1]) << 8;
+    const uint16_t c1 = uint16_t(block[2]) | uint16_t(block[3]) << 8;
+    uint8_t colours[4][4] = {
+        { Expand5(c0 >> 11), Expand6((c0 >> 5) & 63), Expand5(c0 & 31), 255 },
+        { Expand5(c1 >> 11), Expand6((c1 >> 5) & 63), Expand5(c1 & 31), 255 },
+        {}, {}
+    };
+    if (c0 > c1 || forceFourColour)
+    {
+        for (uint32_t k = 0; k < 3; ++k)
+        {
+            colours[2][k] = uint8_t((2u * colours[0][k] + colours[1][k]) / 3u);
+            colours[3][k] = uint8_t((colours[0][k] + 2u * colours[1][k]) / 3u);
+        }
+        colours[2][3] = colours[3][3] = 255;
+    }
+    else
+    {
+        for (uint32_t k = 0; k < 3; ++k)
+            colours[2][k] = uint8_t((uint32_t(colours[0][k]) + colours[1][k]) / 2u);
+        colours[2][3] = 255;
+        memset(colours[3], 0, sizeof colours[3]);
+    }
+    const uint32_t indices = uint32_t(block[4]) | uint32_t(block[5]) << 8 |
+                             uint32_t(block[6]) << 16 | uint32_t(block[7]) << 24;
+    for (uint32_t i = 0; i < 16; ++i)
+        memcpy(rgba[i], colours[(indices >> (2u * i)) & 3u], 4);
+}
+
+static void DecodeBcChannel(const uint8_t* block, uint8_t values[16])
+{
+    uint8_t table[8] = { block[0], block[1] };
+    if (table[0] > table[1])
+        for (uint32_t i = 1; i <= 6; ++i)
+            table[i + 1] = uint8_t(((7u - i) * table[0] + i * table[1]) / 7u);
+    else
+    {
+        for (uint32_t i = 1; i <= 4; ++i)
+            table[i + 1] = uint8_t(((5u - i) * table[0] + i * table[1]) / 5u);
+        table[6] = 0;
+        table[7] = 255;
+    }
+    uint64_t indices = 0;
+    for (uint32_t i = 0; i < 6; ++i)
+        indices |= uint64_t(block[2 + i]) << (8u * i);
+    for (uint32_t i = 0; i < 16; ++i)
+        values[i] = table[(indices >> (3u * i)) & 7u];
+}
+
+static bool DecodeBcBlock(uint32_t fmt, const uint8_t* block, uint8_t rgba[16][4])
+{
+    switch (fmt)
+    {
+        case xenos::kFmt_DXT1:
+        case xenos::kFmt_DXT1_AS_16_16_16_16:
+            DecodeBcColour(block, false, rgba);
+            return true;
+        case xenos::kFmt_DXT2_3:
+        case xenos::kFmt_DXT2_3_AS_16_16_16_16:
+            DecodeBcColour(block + 8, true, rgba);
+            for (uint32_t i = 0; i < 16; ++i)
+                rgba[i][3] = uint8_t(((block[i >> 1] >> (4u * (i & 1u))) & 15u) * 17u);
+            return true;
+        case xenos::kFmt_DXT4_5:
+        case xenos::kFmt_DXT4_5_AS_16_16_16_16:
+        {
+            uint8_t alpha[16];
+            DecodeBcChannel(block, alpha);
+            DecodeBcColour(block + 8, true, rgba);
+            for (uint32_t i = 0; i < 16; ++i)
+                rgba[i][3] = alpha[i];
+            return true;
+        }
+        case xenos::kFmt_DXT5A:
+        {
+            uint8_t red[16];
+            DecodeBcChannel(block, red);
+            for (uint32_t i = 0; i < 16; ++i)
+            {
+                rgba[i][0] = red[i]; rgba[i][1] = 0; rgba[i][2] = 0; rgba[i][3] = 255;
+            }
+            return true;
+        }
+        case xenos::kFmt_DXT3A:
+            DecodeBcColour(block + 8, true, rgba);
+            for (uint32_t i = 0; i < 16; ++i)
+                rgba[i][3] = uint8_t(((block[i >> 1] >> (4u * (i & 1u))) & 15u) * 17u);
+            return true;
+        case xenos::kFmt_DXN:
+        {
+            uint8_t red[16], green[16];
+            DecodeBcChannel(block, red);
+            DecodeBcChannel(block + 8, green);
+            for (uint32_t i = 0; i < 16; ++i)
+            {
+                rgba[i][0] = red[i]; rgba[i][1] = green[i];
+                rgba[i][2] = 0; rgba[i][3] = 255;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// Converts every copy region independently, preserving mip offsets and cube layer
+// ordering. This is used only when a compatibility device cannot create BC images.
+static bool DecodeBcUpload(uint32_t fmt, uint32_t blockBytes,
+                           std::vector<uint8_t>& pixels,
+                           std::vector<VkBufferImageCopy>& copies)
+{
+    std::vector<uint8_t> decoded;
+    std::vector<VkBufferImageCopy> decodedCopies;
+    decodedCopies.reserve(copies.size());
+    for (const VkBufferImageCopy& sourceCopy : copies)
+    {
+        VkBufferImageCopy copy = sourceCopy;
+        copy.bufferOffset = decoded.size();
+        const uint32_t width = copy.imageExtent.width;
+        const uint32_t height = copy.imageExtent.height;
+        const uint32_t blocksWide = (width + 3) / 4;
+        const uint32_t blocksHigh = (height + 3) / 4;
+        const uint32_t layers = copy.imageSubresource.layerCount;
+        const uint64_t compressedLayerBytes =
+            uint64_t(blocksWide) * blocksHigh * blockBytes;
+        const uint64_t decodedLayerBytes = uint64_t(width) * height * 4;
+        if (sourceCopy.bufferOffset + compressedLayerBytes * layers > pixels.size())
+            return false;
+        decoded.resize(decoded.size() + size_t(decodedLayerBytes * layers));
+        for (uint32_t layer = 0; layer < layers; ++layer)
+            for (uint32_t by = 0; by < blocksHigh; ++by)
+                for (uint32_t bx = 0; bx < blocksWide; ++bx)
+                {
+                    const uint64_t blockAt = sourceCopy.bufferOffset +
+                        uint64_t(layer) * compressedLayerBytes +
+                        uint64_t(by * blocksWide + bx) * blockBytes;
+                    uint8_t rgba[16][4];
+                    if (!DecodeBcBlock(fmt, pixels.data() + blockAt, rgba))
+                        return false;
+                    for (uint32_t py = 0; py < 4 && by * 4 + py < height; ++py)
+                        for (uint32_t px = 0; px < 4 && bx * 4 + px < width; ++px)
+                        {
+                            const uint64_t texel = uint64_t(layer) * width * height +
+                                uint64_t(by * 4 + py) * width + bx * 4 + px;
+                            memcpy(decoded.data() + copy.bufferOffset + texel * 4,
+                                   rgba[py * 4 + px], 4);
+                        }
+                }
+        decodedCopies.push_back(copy);
+    }
+    pixels.swap(decoded);
+    copies.swap(decodedCopies);
+    return true;
+}
+
 } // namespace (the anonymous one; DecodeTextureFetch below is xenos.h's, and must
   // have external linkage or it will not be the function that header declared)
 
@@ -11270,7 +11433,7 @@ uint32_t UploadTextureUncached(uint8_t* base, const uint32_t* regs, uint32_t con
     }
 
     uint32_t bytesPerUnit = 0, blockDim = 1;
-    const VkFormat format = XenosTextureFormat(t.format, bytesPerUnit, blockDim);
+    VkFormat format = XenosTextureFormat(t.format, bytesPerUnit, blockDim);
     if (format == VK_FORMAT_UNDEFINED)
     {
         static std::vector<uint32_t> seen;
@@ -12148,6 +12311,21 @@ uint32_t UploadTextureUncached(uint8_t* base, const uint32_t* regs, uint32_t con
             uploadAllZero = false;
             Count("texture: pit gravel from REAL asset (pit_gravel_tex.h)");
         }
+    }
+
+    // Vulkan 1.1 does not imply BC texture support, and several target Mali devices do
+    // not expose it. Preserve all guest-byte diagnostics and recovery above in their
+    // original compressed representation, then expand only the final upload payload.
+    // Modern never enters this branch and retains native BC images and staging sizes.
+    if (R->compatibilityDecodeBc && blockDim == 4)
+    {
+        if (!DecodeBcUpload(t.format, bytesPerUnit, pixels, copies))
+        {
+            Count("texture: compatibility BC decode failed");
+            return 0;
+        }
+        format = VK_FORMAT_R8G8B8A8_UNORM;
+        Count("texture: compatibility BC decoded to RGBA8");
     }
 
     // The refresh arm: same image, same slot, new pixels. No allocation, so it can run

@@ -7723,7 +7723,17 @@ static void QueryDeviceCaps(VkPhysicalDevice phys, DeviceCaps& c)
     vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, c.exts.data());
 }
 
+// The Modern path and the still-gated Vulkan 1.1 path have intentionally separate
+// contracts.  Do not make a compatibility device satisfy (or request) a Modern-only
+// feature merely because both contracts are described in this file.
+enum class RendererProfile { Modern, CompatibilityCandidate, Unsupported };
+
 enum class FeatWhere { Core, V12, V13 };
+enum FeatureProfileMask : uint8_t
+{
+    FeatureModern = 1 << 0,
+    FeatureCompatibility = 1 << 1,
+};
 struct FeatureReq
 {
     const char* name;
@@ -7731,46 +7741,47 @@ struct FeatureReq
     size_t offset;
     bool required;
     const char* why;
+    uint8_t profiles;
 };
-#define CZ_FEAT(where, strct, field, req, why)                                         \
-    { #field, FeatWhere::where, offsetof(strct, field), req, why }
+#define CZ_FEAT(where, strct, field, req, why, profiles)                                \
+    { #field, FeatWhere::where, offsetof(strct, field), req, why, profiles }
 static const FeatureReq kFeatureReqs[] = {
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, bufferDeviceAddress, true,
-            "the translated shaders load constants through raw 64-bit addresses"),
+            "the translated shaders load constants through raw 64-bit addresses", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorIndexing, true,
-            "the bindless texture/sampler heaps"),
+            "the bindless texture/sampler heaps", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, runtimeDescriptorArray, true,
-            "the bindless heaps are unsized arrays in the shaders"),
+            "the bindless heaps are unsized arrays in the shaders", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingPartiallyBound, true,
-            "heap slots are bound as textures arrive"),
+            "heap slots are bound as textures arrive", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingUpdateUnusedWhilePending,
-            true, "heap slots are written while a frame is in flight"),
+            true, "heap slots are written while a frame is in flight", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingSampledImageUpdateAfterBind,
-            true, "the texture heap is updated after the set is bound"),
+            true, "the texture heap is updated after the set is bound", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, descriptorBindingVariableDescriptorCount,
-            true, "the heap's size comes from the device, not the layout"),
+            true, "the heap's size comes from the device, not the layout", FeatureModern),
     CZ_FEAT(V12, VkPhysicalDeviceVulkan12Features, shaderSampledImageArrayNonUniformIndexing,
-            true, "a draw's texture index is a per-draw constant"),
+            true, "a draw's texture index is a per-draw constant", FeatureModern),
     CZ_FEAT(V13, VkPhysicalDeviceVulkan13Features, dynamicRendering, true,
-            "no render-pass objects; the EDRAM target is one image"),
+            "no render-pass objects; the EDRAM target is one image", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, shaderInt64, true,
-            "the Int64 capability is in 450 of 450 translated shaders (part 105 census)"),
+            "the Int64 capability is in 450 of 450 translated shaders (part 105 census)", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, independentBlend, true,
-            "per-render-target blend state, as Xenos has"),
+            "per-render-target blend state, as Xenos has", FeatureModern | FeatureCompatibility),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, textureCompressionBC, true,
-            "the title's DXT1/3/5 textures are uploaded as BC"),
+            "the title's DXT1/3/5 textures are uploaded as BC", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, samplerAnisotropy, false,
-            "distance filtering stays trilinear without it (part 41)"),
+            "distance filtering stays trilinear without it (part 41)", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, occlusionQueryPrecise, false,
-            "CZ_VK_RT_COVERAGE cannot report sample counts without it"),
+            "CZ_VK_RT_COVERAGE cannot report sample counts without it", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, pipelineStatisticsQuery, false,
-            "CZ_VK_GPU_STATS (the per-pass vertex/fragment invocation census) needs it"),
+            "CZ_VK_GPU_STATS (the per-pass vertex/fragment invocation census) needs it", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, shaderClipDistance, false,
-            "an XE_USER_CLIP_PLANES shader cache cannot run without it"),
+            "an XE_USER_CLIP_PLANES shader cache cannot run without it", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, fillModeNonSolid, false,
-            "no consumer: every pipeline's polygonMode is FILL"),
+            "no consumer: every pipeline's polygonMode is FILL", FeatureModern),
     CZ_FEAT(Core, VkPhysicalDeviceFeatures, depthClamp, false,
-            "no consumer: no pipeline enables depth clamp"),
+            "no consumer: no pipeline enables depth clamp", FeatureModern),
 };
 #undef CZ_FEAT
 
@@ -7792,11 +7803,8 @@ static VkBool32 FeatHave(const DeviceCaps& c, const FeatureReq& r)
 // The renderer keeps its existing, fast Vulkan 1.3 route as the default.  This
 // classifier deliberately does not enable a partial fallback: it records when a
 // device is a valid target for the Android/Mali compatibility route while that route
-// is being built.  A candidate still returns through the normal modern requirement
-// gate below until its shader ABI, fixed descriptors, render-pass path and texture
-// conversion are all present.
-enum class RendererProfile { Modern, CompatibilityCandidate, Unsupported };
-
+// is being built. A candidate is evaluated against its own narrow contract, then
+// stopped by the explicit Etapa 1 gate until the complete chain is reviewed.
 static RendererProfile ClassifyRendererProfile(const DeviceCaps& c)
 {
     bool modern = c.props.apiVersion >= VK_API_VERSION_1_3;
@@ -7841,10 +7849,15 @@ static void EvaluateRequirements(const DeviceCaps& c, VkPhysicalDeviceFeatures2&
                                  VkPhysicalDeviceVulkan12Features& req12,
                                  VkPhysicalDeviceVulkan13Features& req13,
                                  std::vector<const char*>& missing, const char* tag,
-                                 bool listAll)
+                                 bool listAll, RendererProfile profile)
 {
+    const uint8_t profileMask = profile == RendererProfile::Modern ? FeatureModern
+                                : profile == RendererProfile::CompatibilityCandidate
+                                    ? FeatureCompatibility : 0;
     for (const FeatureReq& r : kFeatureReqs)
     {
+        if (!(r.profiles & profileMask))
+            continue;
         const bool have = FeatHave(c, r) == VK_TRUE;
         if (have)
             FeatSlot(r.where, r.offset, reqF2, req12, req13) = VK_TRUE;
@@ -7894,7 +7907,14 @@ bool CreateDevice()
 {
     VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = "cz_runtime";
-    app.apiVersion = VK_API_VERSION_1_3;
+    // An instance does not select the renderer profile.  Request the newest version
+    // this loader exposes, capped at the Modern route's existing 1.3 contract, so a
+    // Vulkan 1.1 loader can reach capability classification instead of failing before
+    // the (still closed) compatibility gate is named.
+    uint32_t loaderVersion = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion)
+        vkEnumerateInstanceVersion(&loaderVersion);
+    app.apiVersion = std::min(loaderVersion, uint32_t(VK_API_VERSION_1_3));
 
     VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
@@ -8177,6 +8197,33 @@ bool CreateDevice()
             snprintf(drv, sizeof drv, "unknown (device below Vulkan 1.2)");
         BugReport_SetGpu(caps.props.deviceName, drv, caps.props.apiVersion);
     }
+    const RendererProfile profile = ClassifyRendererProfile(caps);
+    if (profile == RendererProfile::CompatibilityCandidate)
+    {
+        // This deliberately exercises only the CompatibilityCandidate contract.  It
+        // must never be rejected for a Modern feature while Etapa 1 is being audited,
+        // and it must not create a device until the remaining chain has been reviewed.
+        VkPhysicalDeviceFeatures2 compatF2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        VkPhysicalDeviceVulkan12Features unused12{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+        };
+        VkPhysicalDeviceVulkan13Features unused13{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+        };
+        std::vector<const char*> missing;
+        EvaluateRequirements(caps, compatF2, unused12, unused13, missing, "[vk]",
+                             /*listAll=*/false, profile);
+        if (!missing.empty())
+        {
+            fprintf(stderr, "[vk] Vulkan 1.1 compatibility baseline is missing:");
+            for (const char* m : missing)
+                fprintf(stderr, " %s", m);
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "[vk] Vulkan 1.1 compatibility gate remains CLOSED: device creation "
+                        "is intentionally deferred until the full Etapa 1 chain is reviewed.\n");
+        return false;
+    }
     if (caps.props.apiVersion < VK_API_VERSION_1_3)
     {
         fprintf(stderr, "[vk] this device reports Vulkan %u.%u.%u and the renderer needs "
@@ -8198,7 +8245,8 @@ bool CreateDevice()
     f2.pNext = &v13;
     {
         std::vector<const char*> missing;
-        EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]", /*listAll=*/false);
+        EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]", /*listAll=*/false,
+                             RendererProfile::Modern);
         if (!missing.empty())
         {
             std::string list;
@@ -34219,7 +34267,7 @@ bool VkRenderer_Diag()
 
     VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = "cz_runtime --diag";
-    app.apiVersion = VK_API_VERSION_1_3;
+    app.apiVersion = std::min(loaderVer, uint32_t(VK_API_VERSION_1_3));
     VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
@@ -34269,7 +34317,14 @@ bool VkRenderer_Diag()
         if (devices[i] != pick)
             continue;
 
-        if (c.props.apiVersion < VK_API_VERSION_1_3)
+        const RendererProfile profile = ClassifyRendererProfile(c);
+        if (profile == RendererProfile::CompatibilityCandidate)
+        {
+            fprintf(stderr, "%s   VERDICT: compatibility candidate; the Vulkan 1.1 gate "
+                            "remains CLOSED pending the full Etapa 1 audit\n", T);
+            ok = false;
+        }
+        else if (c.props.apiVersion < VK_API_VERSION_1_3)
         {
             fprintf(stderr, "%s   VERDICT: CANNOT run the renderer — Vulkan 1.3 is required "
                             "and this device reports %u.%u\n", T,
@@ -34285,7 +34340,7 @@ bool VkRenderer_Diag()
         VkPhysicalDeviceFeatures2 rf2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         std::vector<const char*> missing;
         fprintf(stderr, "%s   features the renderer asks for:\n", T);
-        EvaluateRequirements(c, rf2, r12, r13, missing, T, /*listAll=*/true);
+        EvaluateRequirements(c, rf2, r12, r13, missing, T, /*listAll=*/true, profile);
         if (missing.empty())
             fprintf(stderr, "%s   every REQUIRED feature is present\n", T);
         else

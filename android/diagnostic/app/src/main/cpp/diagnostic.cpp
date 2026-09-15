@@ -37,16 +37,20 @@ std::string Collect() {
     out << "Page size: " << sysconf(_SC_PAGESIZE) << " bytes\n\n";
 
     uint32_t loaderVersion = VK_API_VERSION_1_0;
-    if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&loaderVersion);
+    const auto enumerateInstanceVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+    if (enumerateInstanceVersion) enumerateInstanceVersion(&loaderVersion);
     out << "Vulkan loader: " << Version(loaderVersion) << '\n';
 
-    VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    VkApplicationInfo application{};
+    application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application.pApplicationName = "RisingRecomp Diagnostic";
     application.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     application.pEngineName = "RisingRecomp";
     application.apiVersion = std::min(loaderVersion, VK_API_VERSION_1_3);
 
-    VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    VkInstanceCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &application;
     VkInstance instance = VK_NULL_HANDLE;
     VkResult result = vkCreateInstance(&createInfo, nullptr, &instance);
@@ -73,14 +77,21 @@ std::string Collect() {
         vkEnumerateDeviceExtensionProperties(
                 devices[index], nullptr, &extensionCount, extensions.data());
 
-        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        VkPhysicalDeviceVulkan12Features features12{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-        VkPhysicalDeviceVulkan13Features features13{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        features.pNext = &features12;
-        features12.pNext = &features13;
-        vkGetPhysicalDeviceFeatures2(devices[index], &features);
+        VkPhysicalDeviceFeatures2 features{};
+        features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        VkPhysicalDeviceVulkan12Features features12{};
+        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceVulkan13Features features13{};
+        features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        const auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+        if (getFeatures2) {
+            features.pNext = &features12;
+            features12.pNext = &features13;
+            getFeatures2(devices[index], &features);
+        } else {
+            vkGetPhysicalDeviceFeatures(devices[index], &features.features);
+        }
 
         out << "\n[GPU " << index << "]\n";
         out << "Name: " << properties.deviceName << '\n';

@@ -8276,6 +8276,15 @@ bool CreateDevice()
         ClassifyRendererProfile(caps) == RendererProfile::CompatibilityCandidate;
     R->compatibilityDecodeBc =
         R->compatibilityProfile && caps.f2.features.textureCompressionBC != VK_TRUE;
+    if (R->compatibilityProfile && R->wantSwapchain &&
+        !caps.HasExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+    {
+        fprintf(stderr, "[vk] Vulkan 1.1 compatibility: VK_KHR_swapchain is absent — "
+                        "presenting through the readback path instead\n");
+        vkDestroySurfaceKHR(R->instance, R->swap.surface, nullptr);
+        R->swap.surface = VK_NULL_HANDLE;
+        R->wantSwapchain = false;
+    }
     {
         // The bug report's GPU line: the device, and the driver's own name + version.
         char drv[320];
@@ -28941,24 +28950,26 @@ bool InitCommon()
                     unsigned(R->depth.format));
     }
 
-    // 128 MB of per-frame arena. The frontend's streams are small; gameplay is the
-    // question, and the high-water mark is printed with the stats so the number can be
-    // raised on evidence rather than guessed at again.
+    // Modern starts with 128 MB per frame. Compatibility starts at the measured 256 MB
+    // steady size so its first crowded frame is not sacrificed to arena growth on a
+    // unified-memory device. The high-water mark remains printed for both profiles.
     //
     // It GROWS now (see BeginFrame), so this is the STARTING size rather than the limit.
-    // 128 is kept as the start deliberately: it is the size every measurement in this
-    // port up to part 18 was taken at, so `CZ_VK_NO_ARENA_GROWTH=1` reproduces the old
-    // renderer exactly and remains a usable control arm. CZ_VK_ARENA_MB=N sets the
-    // start, which is how the 128-vs-512 A/B that identified the black frames was run.
+    // 128 is kept as the Modern start deliberately: it is the size every measurement in
+    // this port up to part 18 was taken at, so `CZ_VK_NO_ARENA_GROWTH=1` still reproduces
+    // the old Modern renderer exactly. CZ_VK_ARENA_MB=N overrides either profile.
     static const uint64_t arenaMb =
-        Env("CZ_VK_ARENA_MB") ? strtoull(Env("CZ_VK_ARENA_MB"), nullptr, 10) : 128;
+        Env("CZ_VK_ARENA_MB") ? strtoull(Env("CZ_VK_ARENA_MB"), nullptr, 10)
+                              : R->compatibilityProfile ? 256 : 128;
     // The CROSS-FRAME stream store, same usage and memory type as the arena because the
     // GPU cannot tell them apart — the only difference is that this one is not reset at
     // the swap. `PersistMaintenance` doubles it when a frame overruns it.
-    // CZ_VK_PERSIST_MB=N sets the start.
+    // CZ_VK_PERSIST_MB=N sets the start. Compatibility uses 256 MB: its measured
+    // high-water is 141 MB, so attempting Modern's 1 GB first is needless mobile
+    // allocation pressure while still leaving verified headroom.
     //
-    // **THE DEFAULT IS 1024 — THE CEILING — AS OF PART 79, AND IT WAS 128 FOR TWENTY-TWO
-    // PARTS.** A growth is not a background cost: it is `WaitAllFramesIdle` +
+    // **THE MODERN DEFAULT IS 1024 — THE CEILING — AS OF PART 79, AND IT WAS 128 FOR
+    // TWENTY-TWO PARTS.** A growth is not a background cost: it is `WaitAllFramesIdle` +
     // `vkDeviceWaitIdle` + a host-visible allocation and MAP + freeing the old buffer, all
     // on the pump inside ONE frame. The operator's part-79 session grew twice, 128 -> 256
     // -> 512, and **both growths were the worst frame of their own ten-second window and
@@ -28987,7 +28998,8 @@ bool InitCommon()
     // Note the waits are the SMALLEST of the three terms in a growth. Fencing the old
     // buffer away — the obvious, principled repair — would have bought 19% of it.
     static const uint64_t persistMb =
-        Env("CZ_VK_PERSIST_MB") ? strtoull(Env("CZ_VK_PERSIST_MB"), nullptr, 10) : 1024;
+        Env("CZ_VK_PERSIST_MB") ? strtoull(Env("CZ_VK_PERSIST_MB"), nullptr, 10)
+                                : R->compatibilityProfile ? 256 : 1024;
     R->persistOn = !EnvOn("CZ_VK_NO_PERSIST_STREAMS");
 
     // Announce itself, because an arm nobody can see in the log is an arm that cannot be
@@ -29036,12 +29048,15 @@ bool InitCommon()
     // (gotcha 231, §6ar). `CZ_VK_NO_SUBMIT=1` measured the ceiling on removing that
     // serialisation — CPU-only time, ~1.45x — without building it. This is building it.
     //
-    // TWO IS THE DEFAULT AND THREE IS AVAILABLE, and neither is a guess about which
+    // TWO IS THE MODERN DEFAULT AND THREE IS AVAILABLE, and neither is a guess about which
     // wins: one frame of overlap already covers a GPU shorter than the CPU, so 3 should
     // read as noise, and if it does not then the model of where the time goes is wrong
     // and that is worth knowing. Both are one binary, which is what makes the A/B legal.
+    // Compatibility defaults to one frame so the per-frame arena and descriptor pools
+    // are not doubled during initial mobile bring-up; the override remains available.
     static const char* fifEnv = Env("CZ_VK_FRAMES_IN_FLIGHT");
-    R->framesInFlight = fifEnv ? uint32_t(strtoul(fifEnv, nullptr, 10)) : 2;
+    R->framesInFlight = fifEnv ? uint32_t(strtoul(fifEnv, nullptr, 10))
+                               : R->compatibilityProfile ? 1 : 2;
     if (R->framesInFlight < 1)
         R->framesInFlight = 1;
     if (R->framesInFlight > kMaxFramesInFlight)

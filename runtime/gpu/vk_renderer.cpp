@@ -82,6 +82,8 @@
 // DESCRIPTOR SETS. One unbounded array each, matching the HLSL register spaces:
 //   set 0 = Texture2D[]   set 1 = Texture3D[]   set 2 = TextureCube[]
 //   set 3 = Sampler[]     set 4 = Texture1D[]
+// The Vulkan 1.1 profile is deliberately separate: fixed bindings 0..4 in set 0,
+// followed by the VS/PS/shared uniform buffers at bindings 0..2 in set 1.
 // ===================================================================================
 
 namespace {
@@ -6076,14 +6078,14 @@ struct Renderer
 Renderer* R = nullptr;
 
 // Vulkan 1.1 compatibility ABI.  These are deliberately separate from the bindless
-// g_maxDescriptors heap: every draw owns a small, ordinary descriptor table that can
+// g_maxDescriptors heap: every draw owns two small, ordinary descriptor sets that can
 // be reset only when its frame slot's fence has retired.
 // DoDraw publishes Xenos fetch constants 0..15 today. Keeping the fixed tables at
 // that same limit cuts the per-stage sampled-image requirement from 128 to 64, which
 // matters on Vulkan 1.1 Mali/older Adreno drivers. It changes only the compatibility
 // ABI; the modern bindless heaps remain sized by g_maxDescriptors.
 constexpr uint32_t kCompatDescriptorSlots = 16;
-constexpr uint32_t kCompatDescriptorSetsPerDraw = 6;
+constexpr uint32_t kCompatDescriptorSetsPerDraw = 2;
 constexpr uint32_t kCompatDescriptorDrawsPerPool = 256;
 
 static bool CreateCompatibilityDescriptorPool(FrameSlot& frame)
@@ -6110,7 +6112,7 @@ static bool CreateCompatibilityDescriptorPool(FrameSlot& frame)
 }
 
 // The actual draw binder will replace only the slots the draw references and will
-// write its two constant-buffer bindings in set 5.  Initialising all image/sampler
+// write its constant-buffer bindings in set 1. Initialising all image/sampler
 // entries here is essential: the compatibility shaders are compiled all-resources-
 // bound, so an unused fetch must still see a legal white dummy, not an unbound slot.
 [[maybe_unused]] static bool AllocateCompatibilityDescriptorSets(
@@ -6162,8 +6164,8 @@ static bool CreateCompatibilityDescriptorPool(FrameSlot& frame)
                 info.imageView = dummies[set]->view;
         }
         writes[set] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        writes[set].dstSet = out[set];
-        writes[set].dstBinding = 0;
+        writes[set].dstSet = out[0];
+        writes[set].dstBinding = set;
         writes[set].descriptorCount = kCompatDescriptorSlots;
         writes[set].descriptorType = types[set];
         writes[set].pImageInfo = infos[set].data();
@@ -7832,6 +7834,43 @@ static RendererProfile ClassifyRendererProfile(const DeviceCaps& c)
     return RendererProfile::Unsupported;
 }
 
+static void EvaluateCompatibilityLimits(const DeviceCaps& c,
+                                        std::vector<std::string>& missing)
+{
+    const VkPhysicalDeviceLimits& l = c.props.limits;
+    auto need = [&](bool have, const char* name, uint64_t actual, uint64_t required) {
+        if (!have)
+            missing.push_back(std::string(name) + "=" + std::to_string(actual) +
+                              " (needs " + std::to_string(required) + ")");
+    };
+    // These numbers come directly from CreateDescriptorPlumbing's two compatibility
+    // layouts. They are not Modern limits and must not resize its bindless heaps.
+    need(l.maxBoundDescriptorSets >= kCompatDescriptorSetsPerDraw,
+         "maxBoundDescriptorSets", l.maxBoundDescriptorSets,
+         kCompatDescriptorSetsPerDraw);
+    need(l.maxPerStageDescriptorSampledImages >= kCompatDescriptorSlots * 4,
+         "maxPerStageDescriptorSampledImages", l.maxPerStageDescriptorSampledImages,
+         kCompatDescriptorSlots * 4);
+    need(l.maxDescriptorSetSampledImages >= kCompatDescriptorSlots * 4,
+         "maxDescriptorSetSampledImages", l.maxDescriptorSetSampledImages,
+         kCompatDescriptorSlots * 4);
+    need(l.maxPerStageDescriptorSamplers >= kCompatDescriptorSlots,
+         "maxPerStageDescriptorSamplers", l.maxPerStageDescriptorSamplers,
+         kCompatDescriptorSlots);
+    need(l.maxDescriptorSetSamplers >= kCompatDescriptorSlots,
+         "maxDescriptorSetSamplers", l.maxDescriptorSetSamplers,
+         kCompatDescriptorSlots);
+    need(l.maxPerStageDescriptorUniformBuffers >= 2,
+         "maxPerStageDescriptorUniformBuffers", l.maxPerStageDescriptorUniformBuffers, 2);
+    need(l.maxDescriptorSetUniformBuffers >= 3,
+         "maxDescriptorSetUniformBuffers", l.maxDescriptorSetUniformBuffers, 3);
+    need(l.maxPerStageResources >= kCompatDescriptorSlots * 5 + 2,
+         "maxPerStageResources", l.maxPerStageResources,
+         kCompatDescriptorSlots * 5 + 2);
+    need(l.maxUniformBufferRange >= kVsConstBytes,
+         "maxUniformBufferRange", l.maxUniformBufferRange, kVsConstBytes);
+}
+
 static void PrintRendererProfile(const DeviceCaps& c, const char* tag)
 {
     switch (ClassifyRendererProfile(c))
@@ -8227,11 +8266,20 @@ bool CreateDevice()
         std::vector<const char*> missing;
         EvaluateRequirements(caps, f2, v12, v13, missing, "[vk]",
                              /*listAll=*/false, profile);
+        std::vector<std::string> missingLimits;
+        EvaluateCompatibilityLimits(caps, missingLimits);
         if (!missing.empty())
         {
             fprintf(stderr, "[vk] Vulkan 1.1 compatibility baseline is missing:");
             for (const char* m : missing)
                 fprintf(stderr, " %s", m);
+            fprintf(stderr, "\n");
+        }
+        if (!missingLimits.empty())
+        {
+            fprintf(stderr, "[vk] Vulkan 1.1 compatibility descriptor limits are missing:");
+            for (const std::string& m : missingLimits)
+                fprintf(stderr, " %s", m.c_str());
             fprintf(stderr, "\n");
         }
         fprintf(stderr, "[vk] Vulkan 1.1 compatibility gate remains CLOSED: device creation "
@@ -8570,30 +8618,31 @@ bool CreateDescriptorPlumbing()
 {
     if (R->compatibilityProfile)
     {
-        // Fixed arrays need no descriptor-indexing flags. Sets 0..4 mirror the modern
-        // texture register spaces at 16 Xenos fetch slots each; set 5 is the cbuffer
-        // space selected by SeparateCompatibilityConstantSet in shader_translator.cpp.
+        // Fixed arrays need no descriptor-indexing flags. Bindings 0..4 in set 0 mirror
+        // the modern texture register spaces at 16 Xenos fetch slots each. Set 1 owns
+        // the fallback cbuffers. Two sets stay below Vulkan 1.1's guaranteed limit.
         const VkDescriptorType types[5] = {
             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
         };
+        VkDescriptorSetLayoutBinding textureBindings[5]{};
         for (uint32_t i = 0; i < 5; ++i)
         {
-            VkDescriptorSetLayoutBinding b{};
-            b.binding = 0;
-            b.descriptorType = types[i];
-            b.descriptorCount = kCompatDescriptorSlots;
-            b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-            VkDescriptorSetLayoutCreateInfo li{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-            };
-            li.bindingCount = 1;
-            li.pBindings = &b;
-            VK_CHECK(vkCreateDescriptorSetLayout(R->device, &li, nullptr,
-                                                  &R->setLayouts[i]),
-                     "vkCreateDescriptorSetLayout (Vulkan 1.1 fixed texture set)");
+            textureBindings[i].binding = i;
+            textureBindings[i].descriptorType = types[i];
+            textureBindings[i].descriptorCount = kCompatDescriptorSlots;
+            textureBindings[i].stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         }
+        VkDescriptorSetLayoutCreateInfo li{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+        };
+        li.bindingCount = uint32_t(std::size(textureBindings));
+        li.pBindings = textureBindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(R->device, &li, nullptr,
+                                              &R->setLayouts[0]),
+                 "vkCreateDescriptorSetLayout (Vulkan 1.1 fixed textures)");
 
         VkDescriptorSetLayoutBinding constants[3]{};
         constants[0].binding = 0;
@@ -8613,7 +8662,7 @@ bool CreateDescriptorPlumbing()
         };
         cli.bindingCount = 3;
         cli.pBindings = constants;
-        VK_CHECK(vkCreateDescriptorSetLayout(R->device, &cli, nullptr, &R->setLayouts[5]),
+        VK_CHECK(vkCreateDescriptorSetLayout(R->device, &cli, nullptr, &R->setLayouts[1]),
                  "vkCreateDescriptorSetLayout (Vulkan 1.1 constants)");
 
         // Allocate in modest chunks rather than reserving descriptors for a 6,000-draw
@@ -8629,13 +8678,13 @@ bool CreateDescriptorPlumbing()
         pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pcr.size = 32; // retained for diagnostic/draw-ID replacement shaders
         VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 6;
+        pli.setLayoutCount = kCompatDescriptorSetsPerDraw;
         pli.pSetLayouts = R->setLayouts;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcr;
         VK_CHECK(vkCreatePipelineLayout(R->device, &pli, nullptr, &R->pipeLayout),
                  "vkCreatePipelineLayout (Vulkan 1.1 fixed descriptors)");
-        fprintf(stderr, "[vk] Vulkan 1.1 descriptor arena: 16 fixed slots, "
+        fprintf(stderr, "[vk] Vulkan 1.1 descriptor arena: 2 sets/draw, 16 fixed slots, "
                         "256 draws per lazy pool chunk, frame-owned recycling\n");
         return true;
     }
@@ -25075,7 +25124,8 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             uint32_t publishedSampler = samplerSlot;
             if (R->compatibilityProfile)
             {
-                const uint32_t imageSet = dim == 0 ? 4 : dim == 1 ? 0 : dim == 2 ? 1 : 2;
+                const uint32_t imageBinding =
+                    dim == 0 ? 4 : dim == 1 ? 0 : dim == 2 ? 1 : 2;
                 VkDescriptorImageInfo imageInfo{};
                 imageInfo.imageView =
                     CompatibilityTextureView(regs, constIdx, dim, slot);
@@ -25086,15 +25136,15 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                                           : R->linearSampler;
                 VkWriteDescriptorSet writes[2]{};
                 writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                writes[0].dstSet = compatDrawSets[imageSet];
-                writes[0].dstBinding = 0;
+                writes[0].dstSet = compatDrawSets[0];
+                writes[0].dstBinding = imageBinding;
                 writes[0].dstArrayElement = constIdx;
                 writes[0].descriptorCount = 1;
                 writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
                 writes[0].pImageInfo = &imageInfo;
                 writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                writes[1].dstSet = compatDrawSets[3];
-                writes[1].dstBinding = 0;
+                writes[1].dstSet = compatDrawSets[0];
+                writes[1].dstBinding = 3;
                 writes[1].dstArrayElement = constIdx;
                 writes[1].descriptorCount = 1;
                 writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -26221,7 +26271,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
         for (uint32_t i = 0; i < 3; ++i)
         {
             writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            writes[i].dstSet = compatDrawSets[5];
+            writes[i].dstSet = compatDrawSets[1];
             writes[i].dstBinding = i;
             writes[i].descriptorCount = 1;
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -26253,7 +26303,7 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
     }
 
     // Modern shaders read the three addresses below from their push constants. The
-    // Vulkan 1.1 shader ABI reads the same data through set 5's UBOs, so emitting this
+    // Vulkan 1.1 shader ABI reads the same data through set 1's UBOs, so emitting this
     // block there would both request BDA unnecessarily and describe an ABI it does not
     // use. Parallel capture is already disabled for the compatibility recorder.
     if (!R->compatibilityProfile)
@@ -34547,6 +34597,21 @@ bool VkRenderer_Diag()
                 fprintf(stderr, " %s", m);
             fprintf(stderr, "\n");
             ok = false;
+        }
+        if (profile == RendererProfile::CompatibilityCandidate)
+        {
+            std::vector<std::string> missingLimits;
+            EvaluateCompatibilityLimits(c, missingLimits);
+            if (missingLimits.empty())
+                fprintf(stderr, "%s   compatibility descriptor limits: present\n", T);
+            else
+            {
+                fprintf(stderr, "%s   compatibility descriptor limits missing:", T);
+                for (const std::string& m : missingLimits)
+                    fprintf(stderr, " %s", m.c_str());
+                fprintf(stderr, "\n");
+                ok = false;
+            }
         }
         fprintf(stderr, "%s   VK_KHR_swapchain: %s (needed to present into a window)\n", T,
                 c.HasExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME) ? "present" : "ABSENT");

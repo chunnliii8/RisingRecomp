@@ -848,29 +848,61 @@ static bool LowerCompatibilityConstants(std::string& hlsl, std::string& err)
     return true;
 }
 
-static bool SeparateCompatibilityConstantSet(std::string& hlsl, std::string& err)
+static bool CompactCompatibilityDescriptorSets(std::string& hlsl, std::string& err)
 {
-    // Texture1D already owns t0/space4.  Unlike D3D, Vulkan does not give the t/b/s
-    // register classes separate binding namespaces, so leaving the fallback cbuffer
-    // at b0/space4 would make DXC emit two resources at set 4, binding 0.  Put the
-    // per-stage constant buffer in its own set while preserving b0 for VS and b1 for
-    // PS.  The renderer compatibility layout can consequently expose both bindings
-    // in set 5 without changing the modern five-set ABI.
-    auto moveOne = [&](const std::string& declaration) {
-        const size_t at = hlsl.find(declaration);
-        if (at == std::string::npos || hlsl.find(declaration, at + 1) != std::string::npos)
-            return false;
-        hlsl.replace(at, declaration.size(),
-                     declaration.substr(0, declaration.size() - 2) + "5)");
-        return true;
+    // Vulkan 1.1 guarantees only four bound descriptor sets. Compact the five texture
+    // spaces into bindings 0..4 of set 0 and put the three fallback cbuffers in set 1.
+    // Register classes do not have separate binding namespaces in SPIR-V, hence the
+    // sampler deliberately uses binding 3 rather than s0 beside t0.
+    const struct Rewrite { const char* from; const char* to; } rewrites[] = {
+        { "g_Texture3DDescriptorHeap[16] : register(t0, space1)",
+          "g_Texture3DDescriptorHeap[16] : register(t1, space0)" },
+        { "g_TextureCubeDescriptorHeap[16] : register(t0, space2)",
+          "g_TextureCubeDescriptorHeap[16] : register(t2, space0)" },
+        { "g_SamplerDescriptorHeap[16] : register(s0, space3)",
+          "g_SamplerDescriptorHeap[16] : register(s3, space0)" },
+        { "g_Texture1DDescriptorHeap[16] : register(t0, space4)",
+          "g_Texture1DDescriptorHeap[16] : register(t4, space0)" },
+        { "SharedConstants : register(b2, space4)",
+          "SharedConstants : register(b2, space1)" },
     };
-    const bool stageMoved =
-        moveOne("VertexShaderConstants : register(b0, space4)") ||
-        moveOne("PixelShaderConstants : register(b1, space4)");
-    const bool sharedMoved = moveOne("SharedConstants : register(b2, space4)");
-    if (!stageMoved || !sharedMoved)
+    for (const Rewrite& rewrite : rewrites)
     {
-        err = "Vulkan 1.1 constant-set lowering expected one stage and one shared cbuffer";
+        const size_t at = hlsl.find(rewrite.from);
+        if (at == std::string::npos ||
+            hlsl.find(rewrite.from, at + strlen(rewrite.from)) != std::string::npos)
+        {
+            err = "Vulkan 1.1 descriptor-set compaction did not find exactly one '" +
+                  std::string(rewrite.from) + "'";
+            return false;
+        }
+        hlsl.replace(at, strlen(rewrite.from), rewrite.to);
+    }
+    const char* stageFrom[] = {
+        "VertexShaderConstants : register(b0, space4)",
+        "PixelShaderConstants : register(b1, space4)",
+    };
+    const char* stageTo[] = {
+        "VertexShaderConstants : register(b0, space1)",
+        "PixelShaderConstants : register(b1, space1)",
+    };
+    uint32_t stageMatches = 0;
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        const size_t at = hlsl.find(stageFrom[i]);
+        if (at == std::string::npos)
+            continue;
+        if (hlsl.find(stageFrom[i], at + strlen(stageFrom[i])) != std::string::npos)
+        {
+            err = "Vulkan 1.1 descriptor-set compaction found a duplicate stage cbuffer";
+            return false;
+        }
+        hlsl.replace(at, strlen(stageFrom[i]), stageTo[i]);
+        ++stageMatches;
+    }
+    if (stageMatches != 1)
+    {
+        err = "Vulkan 1.1 descriptor-set compaction expected exactly one stage cbuffer";
         return false;
     }
     return true;
@@ -930,6 +962,31 @@ static bool SpirvHasCapability(const std::vector<uint8_t>& spv, uint32_t wanted)
         i += wordCount;
     }
     return false;
+}
+
+static bool SpirvDescriptorSetsAtMost(const std::vector<uint8_t>& spv, uint32_t maximum)
+{
+    if (spv.size() < 5 * sizeof(uint32_t) || (spv.size() % sizeof(uint32_t)) != 0)
+        return false;
+    for (size_t i = 5, count = spv.size() / sizeof(uint32_t); i < count;)
+    {
+        auto word = [&](size_t at) {
+            uint32_t value;
+            memcpy(&value, spv.data() + at * sizeof(uint32_t), sizeof(value));
+            return value;
+        };
+        const uint32_t instruction = word(i);
+        const uint16_t wordCount = uint16_t(instruction >> 16);
+        const uint16_t opcode = uint16_t(instruction & 0xFFFFu);
+        if (!wordCount || i + wordCount > count)
+            return false;
+        // OpDecorate target Decoration literal; DescriptorSet is decoration 34.
+        if (opcode == 71 && wordCount >= 4 && word(i + 2) == 34 &&
+            word(i + 3) > maximum)
+            return false;
+        i += wordCount;
+    }
+    return true;
 }
 
 static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag, Profile profile,
@@ -1084,9 +1141,9 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
     {
         if (!LowerCompatibilityConstants(out.hlsl, err))
             return false;
-        if (!SeparateCompatibilityConstantSet(out.hlsl, err))
-            return false;
         if (!LowerCompatibilityDescriptors(out.hlsl, err))
+            return false;
+        if (!CompactCompatibilityDescriptorSets(out.hlsl, err))
             return false;
     }
 
@@ -1114,6 +1171,11 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
             SpirvHasCapability(out.spirv, kSpvCapabilityRuntimeDescriptorArray))
         {
             err = "Vulkan 1.1 descriptor lowering still emitted bindless capabilities";
+            return false;
+        }
+        if (!SpirvDescriptorSetsAtMost(out.spirv, 1))
+        {
+            err = "Vulkan 1.1 shader escaped the compact two-set descriptor ABI";
             return false;
         }
     }

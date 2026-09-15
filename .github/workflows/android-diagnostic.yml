@@ -30,6 +30,27 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
+      - name: Generate Vulkan 1.1 compatibility shaders
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          shader_dir=android/diagnostic/app/build/generated
+          mkdir -p "$shader_dir"
+          glslangValidator -V --target-env vulkan1.0 -S vert \
+            android/diagnostic/app/src/main/shaders/compat.vert -o "$shader_dir/compat.vert.spv"
+          glslangValidator -V --target-env vulkan1.0 -S frag \
+            android/diagnostic/app/src/main/shaders/compat.frag -o "$shader_dir/compat.frag.spv"
+          {
+            echo '#pragma once'
+            echo '#include <cstdint>'
+            echo 'inline constexpr uint32_t kCompatibilityVertexSpv[] = {'
+            od -An -v -t x4 "$shader_dir/compat.vert.spv" | awk '{for (i=1;i<=NF;i++) printf "0x%s, ", $i}'
+            echo '};'
+            echo 'inline constexpr uint32_t kCompatibilityFragmentSpv[] = {'
+            od -An -v -t x4 "$shader_dir/compat.frag.spv" | awk '{for (i=1;i<=NF;i++) printf "0x%s, ", $i}'
+            echo '};'
+          } > "$shader_dir/compat_shaders_spv.h"
+
       - name: Build ARM64 diagnostic APK
         working-directory: android/diagnostic
         run: gradle --no-daemon :app:assembleDebug

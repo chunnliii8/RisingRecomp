@@ -3,8 +3,7 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
-#include "null_ps_spv.h"
-#include "rt_factor_spv.h"
+#include "compat_shaders_spv.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -276,16 +275,14 @@ std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
         return out.str();
     }
 
-    std::vector<uint32_t> vertexSpv(std::begin(kRtFactorVsSpv), std::end(kRtFactorVsSpv));
-    vertexSpv[1] = 0x00010000;  // Basic instructions only; advertise SPIR-V 1.0 for Vulkan 1.1.
     VkShaderModuleCreateInfo shaderInfo{};
     shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderInfo.codeSize = vertexSpv.size() * sizeof(uint32_t);
-    shaderInfo.pCode = vertexSpv.data();
+    shaderInfo.codeSize = sizeof(kCompatibilityVertexSpv);
+    shaderInfo.pCode = kCompatibilityVertexSpv;
     result = vkCreateShaderModule(objects.device, &shaderInfo, nullptr, &objects.vertexShader);
     if (result == VK_SUCCESS) {
-        shaderInfo.codeSize = sizeof(kNullPixelShaderSpv);
-        shaderInfo.pCode = kNullPixelShaderSpv;
+        shaderInfo.codeSize = sizeof(kCompatibilityFragmentSpv);
+        shaderInfo.pCode = kCompatibilityFragmentSpv;
         result = vkCreateShaderModule(objects.device, &shaderInfo, nullptr, &objects.fragmentShader);
     }
     if (result != VK_SUCCESS) {
@@ -297,7 +294,7 @@ std::string RunCompatibilityProbe(VkPhysicalDevice physicalDevice) {
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = objects.vertexShader;
-    stages[0].pName = "vsMain";
+    stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = objects.fragmentShader;

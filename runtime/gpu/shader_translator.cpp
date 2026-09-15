@@ -822,6 +822,59 @@ static std::wstring Widen(const std::string& s)
     return w;
 }
 
+static bool LowerCompatibilityConstants(std::string& hlsl, std::string& err)
+{
+    // XenosRecomp already emits a descriptor-backed cbuffer ABI in every generated
+    // shader's non-SPIR-V branch.  Keep the modern branch byte-identical and select
+    // that existing ABI only while compiling the Vulkan 1.1 profile.  Requiring at
+    // least one marker makes an upstream emitter change a named failure instead of a
+    // compatibility shader that silently retained raw addresses.
+    const std::string from = "#ifdef __spirv__";
+    const std::string to =
+        "#if defined(__spirv__) && !defined(XE_VULKAN11_COMPAT)";
+    size_t at = 0;
+    size_t changed = 0;
+    while ((at = hlsl.find(from, at)) != std::string::npos)
+    {
+        hlsl.replace(at, from.size(), to);
+        at += to.size();
+        ++changed;
+    }
+    if (changed == 0)
+    {
+        err = "Vulkan 1.1 constant lowering found no __spirv__ ABI marker";
+        return false;
+    }
+    return true;
+}
+
+static bool SpirvHasCapability(const std::vector<uint8_t>& spv, uint32_t wanted)
+{
+    if (spv.size() < 5 * sizeof(uint32_t) || (spv.size() % sizeof(uint32_t)) != 0)
+        return false;
+    const size_t words = spv.size() / sizeof(uint32_t);
+    size_t i = 5;
+    while (i < words)
+    {
+        uint32_t instruction = 0;
+        memcpy(&instruction, spv.data() + i * sizeof(uint32_t), sizeof(instruction));
+        const uint16_t wordCount = uint16_t(instruction >> 16);
+        const uint16_t opcode = uint16_t(instruction & 0xFFFFu);
+        if (wordCount == 0 || i + wordCount > words)
+            return false;
+        if (opcode == 17 && wordCount >= 2) // OpCapability
+        {
+            uint32_t capability = 0;
+            memcpy(&capability, spv.data() + (i + 1) * sizeof(uint32_t),
+                   sizeof(capability));
+            if (capability == wanted)
+                return true;
+        }
+        i += wordCount;
+    }
+    return false;
+}
+
 static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag, Profile profile,
                          std::vector<uint8_t>& spv, std::string& err)
 {
@@ -972,23 +1025,8 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
 
     if (profile == Profile::Vulkan11Compatibility)
     {
-        // The lowering pass is landed separately.  Until it has removed both pieces
-        // of the modern ABI, fail by construction instead of producing SPIR-V that
-        // carries Int64/non-uniform descriptor requirements under a compatibility
-        // cache name.  These checks are against the generated HLSL because DXC can
-        // fold the corresponding operations in the final module.
-        const bool hasRawAddress = out.hlsl.find("vk::RawBufferLoad") != std::string::npos;
-        const bool hasBindlessHeap =
-            out.hlsl.find("DescriptorHeap[]") != std::string::npos;
-        if (hasRawAddress || hasBindlessHeap)
-        {
-            err = "Vulkan 1.1 compatibility lowering incomplete:";
-            if (hasRawAddress)
-                err += " raw-address constants";
-            if (hasBindlessHeap)
-                err += " bindless descriptor heap";
+        if (!LowerCompatibilityConstants(out.hlsl, err))
             return false;
-        }
     }
 
     std::vector<int> aluLits;
@@ -998,7 +1036,27 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
     if (!BuildMetaJson(isVs, u, tfSorted, aluLits, aluDyn, out.metaJson, err))
         return false;
 
-    return CompileSpirv(out.hlsl, isVs, tag, profile, out.spirv, err);
+    if (!CompileSpirv(out.hlsl, isVs, tag, profile, out.spirv, err))
+        return false;
+
+    if (profile == Profile::Vulkan11Compatibility)
+    {
+        constexpr uint32_t kSpvCapabilityInt64 = 11;
+        if (SpirvHasCapability(out.spirv, kSpvCapabilityInt64))
+        {
+            err = "Vulkan 1.1 constant lowering still emitted Int64 capability";
+            return false;
+        }
+        // Constants are now lowered, but an unsized descriptor heap still makes the
+        // module non-portable.  Keep the pair unwritable until the next subblock lowers
+        // its texture/sampler ABI too.
+        if (out.hlsl.find("DescriptorHeap[]") != std::string::npos)
+        {
+            err = "Vulkan 1.1 constants lowered; bindless descriptor lowering pending";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Translate(const std::string& name, const uint8_t* ucode, size_t size,

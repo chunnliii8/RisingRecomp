@@ -885,12 +885,14 @@ static bool SeparateCompatibilityConstantSet(std::string& hlsl, std::string& err
 
 static bool LowerCompatibilityDescriptors(std::string& hlsl, std::string& err)
 {
-    // Xenos addresses at most 32 texture-fetch constants.  A fixed array indexed by
-    // that per-draw slot is core Vulkan descriptor behavior; it needs neither runtime
-    // descriptor arrays nor update-after-bind.  The renderer-side binder will remap
-    // each draw's global texture handles into these 32 local slots.
+    // The current renderer deliberately publishes fetch constants 0..15 per draw.
+    // Keep the compatibility ABI at that proven bound: five 16-entry arrays fit much
+    // more comfortably within Vulkan 1.1 mobile descriptor limits than five 32-entry
+    // arrays, while every higher Xenos fetch is already skipped by the draw binder.
+    // This is core Vulkan descriptor behavior; it needs neither runtime descriptor
+    // arrays nor update-after-bind.
     const std::string from = "DescriptorHeap[]";
-    const std::string to = "DescriptorHeap[32]";
+    const std::string to = "DescriptorHeap[16]";
     size_t at = 0;
     size_t changed = 0;
     while ((at = hlsl.find(from, at)) != std::string::npos)

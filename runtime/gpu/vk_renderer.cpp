@@ -6909,10 +6909,14 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
                   VkMemoryPropertyFlags props, bool deviceAddress,
                   const char* vramName)
 {
+    // The compatibility ABI addresses all shader-visible constants through ordinary
+    // descriptor buffers.  Do not make a Vulkan 1.1 device request BDA merely because
+    // this shared allocator also serves the Modern raw-address route.
+    const bool needsDeviceAddress = deviceAddress && !R->compatibilityProfile;
     b.size = size;
     VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     ci.size = size;
-    ci.usage = usage | (deviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+    ci.usage = usage | (needsDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VK_CHECK(vkCreateBuffer(R->device, &ci, nullptr, &b.buffer), "vkCreateBuffer");
 
@@ -6949,7 +6953,7 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
     VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
     flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    ai.pNext = deviceAddress ? &flags : nullptr;
+    ai.pNext = needsDeviceAddress ? &flags : nullptr;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = type;
     VK_CHECK(vkAllocateMemory(R->device, &ai, nullptr, &b.memory), "vkAllocateMemory");
@@ -6960,7 +6964,7 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
                              reinterpret_cast<void**>(&b.mapped)),
                  "vkMapMemory");
 
-    if (deviceAddress)
+    if (needsDeviceAddress)
     {
         VkBufferDeviceAddressInfo di{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
         di.buffer = b.buffer;
@@ -26058,23 +26062,26 @@ void DoDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
             ++R->skips.sets;
     }
 
-    // The three constant-buffer addresses, then THE DRAW INDEX at offset 24 for the
-    // draw-ID pass. The index is pushed on every draw, armed or not: it costs four bytes
-    // in a call that is already being made, and a value that is only correct when an
-    // instrument is enabled is a trap for the next person to use it.
-    struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
-        uint64_t(R->arena.address + vsConstAt),
-        uint64_t(R->arena.address + psConstAt),
-        uint64_t(sharedBuf.address + sharedAt),
-        uint32_t(R->drawsThisFrame), 0 };
-    if (capturing)
-        memcpy(&cap.push, &pushConstants, sizeof cap.push);
-    else if (!NoDriverRecord())
-        vkCmdPushConstants(R->cmd, R->pipeLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32,
-                           &pushConstants);
-    else
-        ++g_noDriverRecordSkipped;
+    // Modern shaders read the three addresses below from their push constants. The
+    // Vulkan 1.1 shader ABI reads the same data through set 5's UBOs, so emitting this
+    // block there would both request BDA unnecessarily and describe an ABI it does not
+    // use. Parallel capture is already disabled for the compatibility recorder.
+    if (!R->compatibilityProfile)
+    {
+        struct { uint64_t vs, ps, shared; uint32_t drawIndex, pad; } pushConstants = {
+            uint64_t(R->arena.address + vsConstAt),
+            uint64_t(R->arena.address + psConstAt),
+            uint64_t(sharedBuf.address + sharedAt),
+            uint32_t(R->drawsThisFrame), 0 };
+        if (capturing)
+            memcpy(&cap.push, &pushConstants, sizeof cap.push);
+        else if (!NoDriverRecord())
+            vkCmdPushConstants(R->cmd, R->pipeLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 32, &pushConstants);
+        else
+            ++g_noDriverRecordSkipped;
+    }
 
     // THE CONSTANT-SLOT RACE DETECTOR's record half. This is the right place and the only
     // right place: the address has just been pushed, so these are exactly the bytes this

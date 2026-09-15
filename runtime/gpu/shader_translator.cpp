@@ -856,28 +856,21 @@ static bool SeparateCompatibilityConstantSet(std::string& hlsl, std::string& err
     // per-stage constant buffer in its own set while preserving b0 for VS and b1 for
     // PS.  The renderer compatibility layout can consequently expose both bindings
     // in set 5 without changing the modern five-set ABI.
-    const std::string marker = "ShaderConstants : register(b";
-    const std::string from = ", space4)";
-    const std::string to = ", space5)";
-    const size_t nameAt = hlsl.find(marker);
-    if (nameAt == std::string::npos)
+    auto moveOne = [&](const std::string& declaration) {
+        const size_t at = hlsl.find(declaration);
+        if (at == std::string::npos || hlsl.find(declaration, at + 1) != std::string::npos)
+            return false;
+        hlsl.replace(at, declaration.size(),
+                     declaration.substr(0, declaration.size() - 2) + "5)");
+        return true;
+    };
+    const bool stageMoved =
+        moveOne("VertexShaderConstants : register(b0, space4)") ||
+        moveOne("PixelShaderConstants : register(b1, space4)");
+    const bool sharedMoved = moveOne("SharedConstants : register(b2, space4)");
+    if (!stageMoved || !sharedMoved)
     {
-        err = "Vulkan 1.1 constant-set lowering found no shader cbuffer";
-        return false;
-    }
-    const size_t spaceAt = hlsl.find(from, nameAt + marker.size());
-    if (spaceAt == std::string::npos)
-    {
-        err = "Vulkan 1.1 shader cbuffer was not in register space4";
-        return false;
-    }
-    hlsl.replace(spaceAt, from.size(), to);
-
-    // One generated module contains exactly one stage cbuffer.  Refuse ambiguous
-    // emitter output rather than accidentally moving an unrelated resource.
-    if (hlsl.find(marker, nameAt + marker.size()) != std::string::npos)
-    {
-        err = "Vulkan 1.1 constant-set lowering found multiple shader cbuffers";
+        err = "Vulkan 1.1 constant-set lowering expected one stage and one shared cbuffer";
         return false;
     }
     return true;

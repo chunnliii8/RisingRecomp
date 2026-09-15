@@ -6087,7 +6087,7 @@ static bool CreateCompatibilityDescriptorPool(FrameSlot& frame)
           kCompatDescriptorSlots * 4 * kCompatDescriptorDrawsPerPool },
         { VK_DESCRIPTOR_TYPE_SAMPLER,
           kCompatDescriptorSlots * kCompatDescriptorDrawsPerPool },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * kCompatDescriptorDrawsPerPool },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kCompatDescriptorDrawsPerPool },
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = kCompatDescriptorSetsPerDraw * kCompatDescriptorDrawsPerPool;
@@ -7268,7 +7268,7 @@ void ChooseEdramDepthFormat(VkPhysicalDevice phys)
     if (EnvOn("CZ_VK_DEPTH_FLOAT"))
     {
         g_edramDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
-        fprintf(stderr, "[vk] ED◊6˜ùõ ◊¨¢h≠µÁYHõ›àÀ»LéÃå[à\»]H[ôML\\ù[ôHúò[YI‹»ö\ú›[BàÀ»
+        fprintf(stderr, "[vk] ED◊7€Ωõ ◊¨¢h≠µÁX\ôHõ›àÀ»LéÃå[à\»]H[ôML\\ù[ôHúò[YI‹»ö\ú›[BàÀ»
 ÿ⁄\‹€‹à]H‹öY⁄[ãçŸàLé⁄YJH\⁄‹»\»]Y\›[€àŸà[BàÀ»]ô\ûHúò[YKÇàYà
 Z[ùç›
 [JHèHZ[ùç›

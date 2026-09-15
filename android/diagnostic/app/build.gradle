@@ -1,0 +1,42 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.risingrecomp.diagnostic"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.risingrecomp.diagnostic"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0-diagnostic"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20 -Wall -Wextra -Werror"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt")
+        }
+    }
+}

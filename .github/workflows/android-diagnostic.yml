@@ -1,0 +1,47 @@
+name: Android diagnostic APK
+
+on:
+  push:
+    branches:
+      - risingRecomp
+    paths:
+      - "android/diagnostic/**"
+      - ".github/workflows/android-diagnostic.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build ARM64 diagnostic APK
+        working-directory: android/diagnostic
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK
+        run: |
+          test -s android/diagnostic/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l android/diagnostic/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/librising_diagnostic.so'
+
+      - name: Upload diagnostic APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RisingRecomp-Diagnostic-v0.1.0
+          path: android/diagnostic/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

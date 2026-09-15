@@ -65,3 +65,8 @@ runtime/build-*-oldbase.configure.log
 /cz_runtime.log.1
 /cz_diag.txt
 /cz_diag.txt.1
+
+# Android diagnostic build output and local Gradle state.
+/android/diagnostic/.gradle/
+/android/diagnostic/app/build/
+/android/diagnostic/local.properties

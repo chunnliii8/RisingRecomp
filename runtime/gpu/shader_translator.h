@@ -24,6 +24,12 @@
 
 namespace ShaderTranslator
 {
+enum class Profile
+{
+    Modern,
+    Vulkan11Compatibility,
+};
+
 struct Result
 {
     std::vector<uint8_t> spirv;  // the compiled module, byte-identical to the CLI's
@@ -38,6 +44,13 @@ struct Result
 // Thread-safe: each call uses its own recompiler and a per-thread DXC instance.
 bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
                Result& out, std::string& err);
+
+// Build an explicitly selected shader ABI.  Modern preserves the shipped output.
+// Vulkan11Compatibility is a separate cache/profile and refuses shaders until all
+// raw-address and bindless constructs have been lowered; it never silently emits a
+// modern shader under a compatibility name.
+bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t size,
+                         Profile profile, Result& out, std::string& err);
 
 // Persist one translated shader as the .spv + .meta.json pair the cache is made of.
 // Both writes gated on one success path so a partial pair (a .spv the runtime would

@@ -822,7 +822,7 @@ static std::wstring Widen(const std::string& s)
     return w;
 }
 
-static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag,
+static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag, Profile profile,
                          std::vector<uint8_t>& spv, std::string& err)
 {
     IDxcCompiler3* comp = ThreadCompiler(err);
@@ -842,6 +842,15 @@ static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag,
         L"-Qstrip_debug",
         L"-D", Widen("XE_SHADER_TAG=" + std::to_string(tag)),
     };
+    if (profile == Profile::Vulkan11Compatibility)
+    {
+        // This profile is intentionally a different ABI/cache.  Vulkan 1.1 accepts
+        // SPIR-V 1.3; naming the target prevents DXC from opportunistically emitting
+        // instructions or capabilities from the modern Vulkan environment.
+        args.push_back(L"-fspv-target-env=vulkan1.1");
+        args.push_back(L"-D");
+        args.push_back(L"XE_VULKAN11_COMPAT=1");
+    }
     // CZ_DXC_DEFINES passthrough, same contract as the shell pipeline: extra
     // whitespace-separated tokens, so an arm cache can be built from the same
     // translator into a second directory.
@@ -936,8 +945,8 @@ static bool ParseName(const std::string& name, bool& isVs, uint32_t& tag,
 }
 } // namespace
 
-bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
-               Result& out, std::string& err)
+bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t size,
+                         Profile profile, Result& out, std::string& err)
 {
     bool isVs = false;
     uint32_t tag = 0;
@@ -961,6 +970,27 @@ bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
                                           g_czShaderCommonHSize));
     out.hlsl = std::move(recompiler.out);
 
+    if (profile == Profile::Vulkan11Compatibility)
+    {
+        // The lowering pass is landed separately.  Until it has removed both pieces
+        // of the modern ABI, fail by construction instead of producing SPIR-V that
+        // carries Int64/non-uniform descriptor requirements under a compatibility
+        // cache name.  These checks are against the generated HLSL because DXC can
+        // fold the corresponding operations in the final module.
+        const bool hasRawAddress = out.hlsl.find("vk::RawBufferLoad") != std::string::npos;
+        const bool hasBindlessHeap =
+            out.hlsl.find("DescriptorHeap[]") != std::string::npos;
+        if (hasRawAddress || hasBindlessHeap)
+        {
+            err = "Vulkan 1.1 compatibility lowering incomplete:";
+            if (hasRawAddress)
+                err += " raw-address constants";
+            if (hasBindlessHeap)
+                err += " bindless descriptor heap";
+            return false;
+        }
+    }
+
     std::vector<int> aluLits;
     std::vector<std::string> aluDyn;
     CensusHlsl(out.hlsl, aluLits, aluDyn);
@@ -968,7 +998,13 @@ bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
     if (!BuildMetaJson(isVs, u, tfSorted, aluLits, aluDyn, out.metaJson, err))
         return false;
 
-    return CompileSpirv(out.hlsl, isVs, tag, out.spirv, err);
+    return CompileSpirv(out.hlsl, isVs, tag, profile, out.spirv, err);
+}
+
+bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
+               Result& out, std::string& err)
+{
+    return TranslateForProfile(name, ucode, size, Profile::Modern, out, err);
 }
 
 bool WritePair(const std::filesystem::path& outDir, const std::string& name,

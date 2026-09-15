@@ -848,6 +848,33 @@ static bool LowerCompatibilityConstants(std::string& hlsl, std::string& err)
     return true;
 }
 
+static bool LowerCompatibilityDescriptors(std::string& hlsl, std::string& err)
+{
+    // Xenos addresses at most 32 texture-fetch constants.  A fixed array indexed by
+    // that per-draw slot is core Vulkan descriptor behavior; it needs neither runtime
+    // descriptor arrays nor update-after-bind.  The renderer-side binder will remap
+    // each draw's global texture handles into these 32 local slots.
+    const std::string from = "DescriptorHeap[]";
+    const std::string to = "DescriptorHeap[32]";
+    size_t at = 0;
+    size_t changed = 0;
+    while ((at = hlsl.find(from, at)) != std::string::npos)
+    {
+        hlsl.replace(at, from.size(), to);
+        at += to.size();
+        ++changed;
+    }
+    // 2D, 3D, cube, 1D and sampler heaps.  Refuse an emitter mismatch instead of
+    // leaving one unsized declaration hidden in a supposedly compatible module.
+    if (changed != 5)
+    {
+        err = "Vulkan 1.1 descriptor lowering expected 5 heaps, found " +
+              std::to_string(changed);
+        return false;
+    }
+    return true;
+}
+
 static bool SpirvHasCapability(const std::vector<uint8_t>& spv, uint32_t wanted)
 {
     if (spv.size() < 5 * sizeof(uint32_t) || (spv.size() % sizeof(uint32_t)) != 0)
@@ -1027,6 +1054,8 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
     {
         if (!LowerCompatibilityConstants(out.hlsl, err))
             return false;
+        if (!LowerCompatibilityDescriptors(out.hlsl, err))
+            return false;
     }
 
     std::vector<int> aluLits;
@@ -1042,17 +1071,17 @@ bool TranslateForProfile(const std::string& name, const uint8_t* ucode, size_t s
     if (profile == Profile::Vulkan11Compatibility)
     {
         constexpr uint32_t kSpvCapabilityInt64 = 11;
+        constexpr uint32_t kSpvCapabilityShaderNonUniform = 5301;
+        constexpr uint32_t kSpvCapabilityRuntimeDescriptorArray = 5302;
         if (SpirvHasCapability(out.spirv, kSpvCapabilityInt64))
         {
             err = "Vulkan 1.1 constant lowering still emitted Int64 capability";
             return false;
         }
-        // Constants are now lowered, but an unsized descriptor heap still makes the
-        // module non-portable.  Keep the pair unwritable until the next subblock lowers
-        // its texture/sampler ABI too.
-        if (out.hlsl.find("DescriptorHeap[]") != std::string::npos)
+        if (SpirvHasCapability(out.spirv, kSpvCapabilityShaderNonUniform) ||
+            SpirvHasCapability(out.spirv, kSpvCapabilityRuntimeDescriptorArray))
         {
-            err = "Vulkan 1.1 constants lowered; bindless descriptor lowering pending";
+            err = "Vulkan 1.1 descriptor lowering still emitted bindless capabilities";
             return false;
         }
     }

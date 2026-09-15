@@ -6917,6 +6917,8 @@ bool CreateBuffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage,
     VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     ci.size = size;
     ci.usage = usage | (needsDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+    if (R->compatibilityProfile)
+        ci.usage &= ~VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VK_CHECK(vkCreateBuffer(R->device, &ci, nullptr, &b.buffer), "vkCreateBuffer");
 
@@ -8281,11 +8283,19 @@ bool CreateDevice()
         // helper passes use modern dynamic rendering and are optional enhancements,
         // not part of the Xenos base renderer.
         if (R->compatibilityProfile)
+        {
             wantRt = false;
-        if (const char* e = Env("CZ_VK_RT"); e && atoi(e) == 0)
-            wantRt = false;
-        if (EnvOn("CZ_VK_RT_FORCE"))
-            wantRt = true;
+            if (EnvOn("CZ_VK_RT_FORCE"))
+                fprintf(stderr, "[vk] CZ_VK_RT_FORCE ignored: Vulkan 1.1 compatibility "
+                                "does not enable the modern ray-query path\n");
+        }
+        else
+        {
+            if (const char* e = Env("CZ_VK_RT"); e && atoi(e) == 0)
+                wantRt = false;
+            if (EnvOn("CZ_VK_RT_FORCE"))
+                wantRt = true;
+        }
         R->rtEnabled = wantRt;
     }
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeat{

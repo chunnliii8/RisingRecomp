@@ -8197,6 +8197,8 @@ bool CreateDevice()
     PrintRendererProfile(caps, "[vk]");
     R->compatibilityProfile =
         ClassifyRendererProfile(caps) == RendererProfile::CompatibilityCandidate;
+    R->compatibilityDecodeBc =
+        R->compatibilityProfile && caps.f2.features.textureCompressionBC != VK_TRUE;
     {
         // The bug report's GPU line: the device, and the driver's own name + version.
         char drv[320];

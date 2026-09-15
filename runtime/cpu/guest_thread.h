@@ -1,0 +1,160 @@
+// Guest thread bootstrap. Every thread that runs recompiled code needs a guest-side
+// thread block (r13 points at it) and a guest stack (r1). The block layout is the
+// Xbox 360 kernel's: KPCR (0xAB0 bytes, +0x00 = BE pointer to the TLS area,
+// +0x100 = BE pointer to the TEB, +0x10C = CPU number), then the XAPI TLS area
+// (0x100 bytes = 64 slots x 4), then the TEB (0x2E0, +0x14C = BE thread ID), then
+// the stack growing down from the top of the block.
+//
+// Both constants below come from Case Zero's own XEX header as Xenia prints it in
+// A1, not from a round number and not from a template port:
+//
+//   XEX_HEADER_TLS_INFO:      Slot Count: 64        -> the 0x100 TLS area
+//   XEX_HEADER_DEFAULT_STACK_SIZE: 262144           -> 0x40000
+//
+// and A1 corroborates the stack size independently: Xenia's main XThread runs on
+// 70150000-70190000, which is exactly 0x40000. Using the header value rather than a
+// generous round number is what makes any later stack-overflow symptom mean
+// something.
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <thread>
+
+#include "../kernel/kobject.h"
+
+constexpr uint32_t kDefaultGuestStackSize = 0x40000;
+
+struct GuestThreadContext
+{
+    PPCContext ppcContext{};
+    uint8_t* block{};
+
+    GuestThreadContext(uint32_t cpuNumber, uint32_t stackSize = kDefaultGuestStackSize);
+    ~GuestThreadContext();
+
+    // threadId 0 removes the mapping (see GuestThread::ThreadIdForPcr).
+    static void RegisterPcr(uint32_t pcr, uint32_t threadId);
+};
+
+struct GuestThreadParams
+{
+    uint32_t function; // guest entry point
+    uint32_t arg0;     // r3
+    uint32_t arg1;     // r4 (ExCreateThread's XAPI startup wrapper takes two args)
+    uint32_t flags;
+    uint32_t stackSize;
+};
+
+struct GuestThreadHandle : KernelObject
+{
+    GuestThreadParams params;
+    uint32_t threadId; // assigned at creation; the spawned thread adopts it
+    std::atomic<bool> suspended;
+    std::thread thread;
+
+    GuestThreadHandle(const GuestThreadParams& params);
+    ~GuestThreadHandle() override;
+
+    uint32_t GetThreadId() const { return threadId; }
+    uint32_t Wait(uint32_t timeoutMs) override;
+};
+
+// Thrown by ExTerminateThread to unwind the guest stack back to the thread bootstrap.
+struct GuestThreadExit
+{
+    uint32_t code;
+};
+
+// The kernel object standing for the CALLING guest thread.
+//
+// Win32's GetCurrentThread() does not return a handle — it returns the pseudo-handle
+// 0xFFFFFFFE, a constant meaning "whoever is asking". Code then passes it straight to
+// DuplicateHandle or ObReferenceObjectByHandle to turn it into something real, and
+// Case Zero does both (docs/phase1-notes.md finding 35).
+//
+// It needs its own type rather than reusing GuestThreadHandle, because that type owns
+// the std::thread it spawned and answers Wait() by joining it. A thread asking about
+// *itself* is not the thread that spawned it — the main guest thread was never spawned
+// by us at all — so this one carries an exit flag instead and polls it.
+struct GuestThreadSelf final : KernelObject
+{
+    std::atomic<bool> exited{ false };
+
+    uint32_t Wait(uint32_t timeoutMs) override;
+};
+
+struct GuestThread
+{
+    // Runs the guest function on the calling host thread; returns its r3.
+    static uint32_t Run(const GuestThreadParams& params);
+    // Spawns a host thread for the guest function (CREATE_SUSPENDED honored via
+    // flags bit 0).
+    static GuestThreadHandle* Start(const GuestThreadParams& params, uint32_t* threadId);
+
+    static uint32_t GetCurrentThreadId();
+
+    // Which thread owns a given PCR (r13)?
+    //
+    // Diagnostics see r13 and nothing else: it is what our critical sections record
+    // as an owner, because it is the one value that is unique per guest thread and
+    // visible to the guest itself. But every thread registry here is keyed by thread
+    // id, so a stall trace could say "thread A is spinning on a section held by
+    // thread B" without being able to say which threads those are — and that was
+    // precisely the open question in finding 38. Returns 0 for an unknown PCR.
+    static uint32_t ThreadIdForPcr(uint32_t pcr);
+
+    // Give the HOST thread behind a guest thread id the guest's own name for it
+    // (part 116). The title names its threads from the MAIN thread by id — the
+    // SetThreadName exception's dwThreadID is the created thread's, not -1 — so
+    // the name has to be applied to another thread, which pthread_setname_np can
+    // do given its pthread_t. Registered when the host thread is spawned, so it
+    // cannot lose the race against the parent naming it immediately after
+    // ExCreateThread returns. Returns false when the id is unknown or the platform
+    // cannot name another thread (macOS); the caller logs which.
+    static bool BindHostName(uint32_t threadId, const char* name);
+
+    // CPU seconds consumed so far by the guest thread the title named `name` ("Main
+    // Thread", "Draw Thread"), or a negative number if no thread of that name has been
+    // bound or the platform cannot read another thread's clock. One
+    // pthread_getcpuclockid + clock_gettime; the [fps] line reads it once per window
+    // so the guest's own CPU per frame is on the same line, over the same window, as
+    // the pump's (part 116 — the quantity a guest-side change is measured by).
+    static double CpuSecondsOf(const char* name);
+    // CZ_GUEST_PIN (part 118): move the host thread the title just named onto its
+    // reserved core, if the arm reserves one for that name. No-op otherwise.
+    static void PinHostByName(const char* name);
+
+    // WHERE A GUEST THREAD'S NON-CPU TIME GOES (part 116 item 4). The Main Thread's
+    // CPU per frame is 6.5 ms and the wall under CZ_VK_NO_DODRAW is 8.1: the gap is
+    // time the thread is NOT running, and every blocking wait it can make goes
+    // through our kernel — a single-object wait, a wait-any poll, a sleep, or the
+    // fence park. Each thread accumulates wall nanoseconds and calls per KIND in a
+    // thread_local the [fps] line reads by thread NAME, once a window, so a run
+    // says "main waits 1.6 ms/frame in 3 multi-object waits" without a tracer.
+    enum WaitKind { kWaitSingle = 0, kWaitMulti, kWaitDelay, kWaitFence, kWaitKinds };
+    struct WaitStats
+    {
+        std::atomic<uint64_t> ns[kWaitKinds];
+        std::atomic<uint64_t> calls[kWaitKinds];
+    };
+    // The CALLING thread's accumulator (registered under its guest tid at Run()).
+    static WaitStats& MyWaitStats();
+    // The accumulator of the thread the title named `name`, or null.
+    static const WaitStats* WaitStatsOf(const char* name);
+    // RAII: one timed wait of `kind` on the calling thread.
+    struct WaitScope
+    {
+        WaitKind kind;
+        uint64_t t0;
+        explicit WaitScope(WaitKind k);
+        ~WaitScope();
+    };
+
+    // The calling thread's own kernel object, minted on first use and cached for the
+    // life of the thread. Null only if the guest heap cannot satisfy it.
+    static GuestThreadSelf* Self();
+    // Called from the thread bootstrap once the guest entry point returns, so anyone
+    // holding a handle to this thread stops waiting.
+    static void MarkSelfExited();
+};

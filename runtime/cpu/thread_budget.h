@@ -1,0 +1,135 @@
+#pragma once
+// ===================================================================================
+// THE THREAD BUDGET — one number for the whole runtime, sized from the USER'S machine
+// ===================================================================================
+//
+// WHY THIS EXISTS. The operator's instruction opening part 55 was two sentences and the
+// second is a design constraint, not a preference: *"even if we really needed the 16 core
+// we should still leave core empty for user background item and all. So we should do it
+// smart and depend on amount of core the user has instead of aiming for my machine."*
+//
+// Without a central budget, the trap is arithmetic rather than philosophical. Part 55's
+// plan proposes THREE parallel items (content guards, texture untile, command recording).
+// If each sizes itself the way the guard pool did — `hardware_concurrency() >= 6 ? 4 : …`
+// — then a six-core machine ends up with TWELVE workers plus the graphics pump plus the
+// guest's own busy threads (A1 names JobThread0..5, cAsyncFileSystem and a BigFile
+// decompress thread; part 54's profile has two of them at 80.7% and 70.9% of a core). The
+// machine is then oversubscribed by a factor of two and every one of those threads is
+// slower than it would have been alone.
+//
+// AND THE DENOMINATOR WAS WRONG. `std::thread::hardware_concurrency()` returns 16 on the
+// operator's box, which is a **Ryzen 7 5700: 8 physical cores, 2 threads per core**. Every
+// "N of 16 cores" figure written in this project since part 50 counted logical threads, so
+// the process at 3.75 cores was using 47% of that machine and not 23%. Two SMT siblings
+// share one core's execution resources: a second thread on a busy core buys perhaps 20-30%
+// on a mixed workload and close to nothing on one already saturating the same units, which
+// a memory-latency-bound hash loop very nearly is. So the budget is counted in PHYSICAL
+// cores — logical threads are the right denominator for "how many runnable threads may
+// exist", physical cores for "how much machine is left", and it is the second question
+// this budget is spending. Gotchas 358 and 359.
+//
+// THE POLICY, stated so it can be argued with (docs/perf-plan-part55.md §0b):
+//
+//     physical  = counted from the machine, never divided by an assumed SMT factor
+//     reserved  = 2      # one for the OS/compositor, one for the user's own software
+//     committed = 3      # the graphics pump + the two busy guest threads, measured
+//     floor     = 3 if physical >= 6, else 2 if physical >= 4, else 0
+//     budget    = clamp(max(physical - reserved - committed, floor), 0, 6)
+//
+// The FLOOR was added in part 100 at the operator's request: the bare
+// subtract-reserve-and-commit formula gave a 6-core machine 1 worker and a 4-core
+// machine 0, leaving the mid-range CPUs most real players run almost serial. The floor
+// guarantees a machine with cores to spare actually uses them.
+//
+//   4-core laptop -> 2 workers (was 0)   6-core -> 3 (was 1)
+//   8-core (the operator's) -> 3     12-core and up -> 6, capped.
+//
+// THE CAP OF 6 IS NOT TIMIDITY, it is the ceiling in §0 of the plan: the PM4 walk is
+// serial because a command stream's meaning is positional, and draw submission is ordered
+// because this title depends on overdraw order. Past five or six busy threads there is
+// nothing left to give them, and part 53 measured extra workers doing real harm — 13.1
+// points of core left the pump while 33.2 appeared on the workers, plus ~0.4 ms/frame of
+// cache pollution charged to two phases that had nothing to do with the work moved
+// (gotcha 344).
+//
+// ONE KNOB. `CZ_WORKERS=N` overrides the whole budget and `CZ_WORKERS=0` forces the serial
+// path everywhere. One variable rather than one per pool, because otherwise the arms
+// multiply and no one can say afterwards what a run was configured as. Per-pool arms that
+// already exist (`CZ_VK_GUARD_WORKERS`, `CZ_VK_NO_PARALLEL_GUARD`) still win where they
+// are set, and the start-up print says so.
+//
+// AND IT PRINTS. A performance number taken at an unknown thread count is not comparable
+// with anything — that is gotcha 353's shape a third time over (a parallel measurement has
+// a MACHINE as well as a workload, and naming only one is naming none). So the budget, the
+// machine it was derived from and every share handed out are printed once at start-up.
+
+#include <cstdint>
+#include <thread>
+
+// The machine, counted rather than assumed. Both are cached after the first call.
+unsigned ThreadBudget_PhysicalCores();
+unsigned ThreadBudget_LogicalCpus();
+
+// The policy's result: how many worker threads this whole runtime may run, across all
+// pools. Zero is a legitimate answer and means "take the serial path".
+unsigned ThreadBudget_Total();
+
+// Claim up to `desired` workers for a named pool. Returns what was actually granted,
+// which may be zero. First come, first served — and deliberately so rather than
+// proportionally divided, because with one pool built (the content guards) a division
+// rule would be fitted to a population of one. What makes that safe is that it is LOUD:
+// every claim is printed with what was left, so a pool that gets nothing says so in the
+// log instead of silently running serial. Revisit when the second pool lands.
+//
+// `overrideEnv` names a per-pool environment variable that wins if it is set (e.g.
+// "CZ_VK_GUARD_WORKERS"); pass nullptr for none. Idempotent per pool name: asking twice
+// returns the same grant rather than claiming twice, so a lazily-initialised pool can
+// call this from a `static` initialiser without the count depending on call order.
+unsigned ThreadBudget_Take(const char* pool, unsigned desired, const char* overrideEnv);
+
+// Print the machine, the policy and every share handed out. Safe to call more than once;
+// prints only when something has changed since the last call, so the line that matters —
+// the final allocation — is the last one in the log.
+void ThreadBudget_Report();
+
+// THREADS OUTSIDE THE BUDGET, listed so the report names EVERY pool this process runs
+// (part 103 item 6). The budget counts busy workers; the runtime also runs threads that
+// sit blocked except during a burst — the async pipeline workers (busy for ~60 s on a cold
+// driver cache), the first-sight shader translator, the golden texture writer, the audio
+// pump and the XMA decoder. None of them takes from the budget, and until part 103 none of
+// them appeared in the `[threads]` block, so a log could not say how many threads a
+// six-core box was actually running during the boot warm (§6es: four compilers + pump +
+// guest + three guards = oversubscribed, and nothing printed it). Idempotent per name.
+void ThreadBudget_Note(const char* pool, unsigned threads, const char* how);
+
+// Move the CALLING thread's scheduling priority below the game's threads, or back to
+// normal (part 103 item 4a). For work that should yield the core to the pump and the
+// guest whenever they are runnable — the speculative pipeline warm on a cold driver cache
+// is the case: 155 ms a create on czamd, 1,339 keys, four workers, and the operator felt
+// it as "stuttered from moment to moment" for the first minute of session one. Windows:
+// THREAD_PRIORITY_BELOW_NORMAL; Linux: nice 10 on this thread only (Linux nice is
+// per-thread). `CZ_NO_LOW_PRIORITY=1` is the same-binary control arm — every call is then
+// a counted no-op. Returns whether the priority actually changed.
+bool ThreadBudget_SetLowPriority(bool low);
+
+// Name the CALLING thread for the profiler and the per-thread census (part 116). Every
+// host thread this runtime spawns inherits its creator's comm at clone time, so once
+// the guest named its main thread "Main Thread" the pump, the guard pool and the
+// pipeline workers all reported as "Main Thread" too, and a thread census could not
+// tell the game's threads from ours. Linux keeps 15 characters; on Windows and macOS
+// this is a no-op (the per-thread readers this exists for are Linux tools).
+void ThreadBudget_NameSelf(const char* name);
+
+// CZ_GUEST_PIN (part 118): reserve two physical cores (with their SMT siblings) for the
+// title's Main Thread and Draw Thread. Call PinProcessAway from the process's main
+// thread BEFORE any thread is spawned (affinity is inherited), and PinNamedThread when
+// the title names a thread. Both are no-ops unless the arm is set; see thread_budget.cpp.
+void ThreadBudget_PinProcessAway();
+// Move every thread that is not one of the two pinned ones onto the rest mask; a no-op
+// unless the arm is on. Cheap; called after each pin and once per [fps] window.
+void ThreadBudget_PinSweep();
+// The host thread the title just named (its std::thread handle: pthread_t on POSIX, a
+// HANDLE on Windows), and a thread just spawned by anyone — the latter gets the rest
+// mask, because a spawn inherits its creator's (Linux) or the process's (Windows).
+bool ThreadBudget_PinNamedThread(const char* name, std::thread::native_handle_type h);
+void ThreadBudget_PinRest(std::thread::native_handle_type h);

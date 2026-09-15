@@ -1,0 +1,145 @@
+// Phase 5: the renderer. Translates the PM4 draw stream onto a host Vulkan device
+// using the XenosRecomp-translated shaders in assets/shader_spv.
+//
+// WHERE THIS SITS
+// ---------------
+// The command processor (gpu/pm4.cpp) already walks the guest's real command stream,
+// keeps a register file and knows which microcode is bound. This module is the sink it
+// hands draws to. Nothing here parses packets and nothing here talks to SDL: the draw
+// arrives decoded, and the finished frame leaves as RGBA8 through the present seam
+// phase 3 built.
+//
+// That split is deliberate and it is what findings 38-39 bought. A renderer that
+// reached back into the ring would be able to render a frame the parser never reached,
+// and the frame counter in the window title would stop being the same number the ring
+// trace prints. Everything here happens at a stream position the parser actually got
+// to.
+//
+// EDRAM SEMANTICS, AND WHY THE TARGET IS NOT CLEARED PER FRAME
+// -----------------------------------------------------------
+// The Xbox 360 renders into a 10 MB on-die EDRAM and then RESOLVES a region of it into
+// guest memory. The title clears through the copy block's own clear bits, not with a
+// full-screen draw, so a host renderer that clears its colour target at the top of
+// every frame is inventing a clear the title did not ask for — and one that discards
+// content later passes go on to sample. The target here is persistent, and it is
+// cleared exactly when the guest's resolve says to clear it.
+//
+// OFF BY DEFAULT UNTIL IT IS GOOD ENOUGH TO BE ON: CZ_VKDRAW=1 enables it. That is not
+// timidity, it is the same-binary control arm every claim in this project needs — with
+// it off the runtime is byte-for-byte the phase 3 binary, so "did the renderer change
+// the kernel gates / the frame rate / the stall rate" is one environment variable
+// rather than a rebuild (gotcha 86).
+#pragma once
+
+#include <cstdint>
+
+struct Pm4Draw;
+
+// Bring up the device, load the shader cache, allocate the render targets. Returns
+// false and stays false when CZ_VKDRAW is unset, when there is no usable Vulkan
+// device, or when the shader cache is missing — each of which is reported once, by
+// name, because a renderer that silently declined to start looks exactly like a
+// renderer that started and drew nothing.
+bool VkRenderer_Init();
+
+// True once Init has succeeded. Cheap; makes no Vulkan calls.
+bool VkRenderer_Active();
+
+// D.4 (release plan §3.D): first sight of a microcode hash this run. Called by pm4's
+// BindShader once per distinct hash; if the shader cache cannot answer it, the bytes
+// are translated in-process on a worker and the cache gains the entry — which is where
+// every VERTEX shader in a shipped build comes from, the disc holding none.
+void VkRenderer_OnShaderBind(uint32_t type, uint64_t hash, const uint8_t* code,
+                             uint32_t sizeDwords);
+
+// One draw, from inside the PM4 walk, with the register file and the bound shaders
+// current. Resolves arrive here too — they are draws with RB_MODECONTROL's edram_mode
+// set to kCopy, not a packet of their own — and are routed internally.
+void VkRenderer_Draw(uint8_t* base, const Pm4Draw& draw);
+// Part 117: the same draw from the two-core pump's `cz-draw` thread, with the register
+// file D replayed from the walk's log and the bindings captured at the packet
+// (gpu/pump_split.h). Resolves are routed exactly as VkRenderer_Draw routes them.
+struct Pm4ShaderBinding;
+void VkRenderer_DrawQueued(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
+                           const Pm4ShaderBinding& vs, const Pm4ShaderBinding& ps);
+
+// The XE_SWAP packet: submit the frame, read the resolved surface back and publish it
+// to the window. Called from the same walk, at the swap's own position in the stream.
+void VkRenderer_OnSwap(uint8_t* base, uint32_t frontBuffer, uint32_t width,
+                       uint32_t height);
+
+// The periodic counter block (CZ_VK_STATS=1, and once at exit). Every "we could not
+// draw this" path increments a named counter rather than returning quietly, so the
+// gap between "97 M packets parsed" and "the picture is missing something" is a number
+// instead of a hunt.
+void VkRenderer_DumpStats();
+// PART 71: write the VkPipelineCache back to disk. Called from the two places that end
+// this process — `Host_Shutdown` and main.cpp's signal handler — and NOT from
+// `VkRenderer_DumpStats`, which `CZ_VK_STATS` also calls every N frames: saving there
+// would either write an early, nearly empty blob once (with a once-guard) or write a few
+// hundred KB mid-play (without one), and the second is the hitch this whole item exists
+// to remove. Safe to call more than once; only the first call writes.
+void VkRenderer_SavePipelineCache();
+
+// `cz_runtime --diag` (part 105): every physical device, its driver, the requirements
+// table verdict on the one bring-up would pick, the depth format and MSAA facts — one
+// line per fact, no device created. Returns false when the pick cannot run the
+// renderer. Needs no window and no renderer state.
+bool VkRenderer_Diag();
+
+// Ask the swapchain to rebuild at the next present even though the drawable size is
+// unchanged — the seam a live VSync change needs (part 60): the present mode is a
+// property of the swapchain, so FIFO<->MAILBOX means recreating it. Callable from
+// any thread; a no-op in the readback present arm.
+void VkRenderer_RequestSwapchainRebuild();
+
+// Change the internal render scale (1..4 over 1280x720) at the next frame
+// boundary — the settings panel's resolution row (part 60). Refused loudly when
+// CZ_VK_RES/CZ_VK_RES_SCALE pin the scale for a measurement run.
+void VkRenderer_RequestRenderScale(uint32_t scale);
+
+// Change the internal resolution to an explicit WIDTH x HEIGHT at the next frame
+// boundary — the panel's APPLY press (part 91: the operator's "change internal
+// resolution without restarting", applied on the button and never per step). The
+// caller validates with Settings_ValidInternalRes; the same CZ_VK_RES pin refusal
+// as the scale form applies. Callable from any thread.
+void VkRenderer_RequestInternalRes(uint32_t w, uint32_t h);
+
+// RT stage 2 (part 64): true when the device was created with ray query (probe
+// passed and CZ_VK_RT did not veto). The settings panel's RT SHADOWS row consults
+// it to show UNSUPPORTED and refuse to move — a row that pretends is the gamma
+// slider again. Safe to call before init (false then).
+bool VkRenderer_RtAvailable();
+// 0 = RT is offered, 1 = the device has no ray query, 2 = it has ray query but the
+// route (b) shader variant cache (assets/shader_spv_rt) is missing or unpatched.
+int VkRenderer_RtUnavailableReason();
+
+// The wide-mode horizontal factor k = (9*W)/(16*H) of the internal resolution
+// (1.0 at 16:9). Exported for the game-side fov substitution (cpu/camera_fov.cpp,
+// part 62): in wide mode the game's fov is over-widened by k in tan space so its
+// own 16:9 CULLING frustum covers the 21:9 view, and the renderer narrows the
+// projection back vertically. Depends only on settings/env, safe before init.
+float VkRenderer_WideFovFactor();
+// The EDRAM sample count this run is rendering with (1/2/4; 0 before init) — part
+// 108's panel row compares the persisted setting against it.
+int VkRenderer_MsaaSamples();
+
+// ===================================================================================
+// Phase C (the D3D pivot): the SAME renderer driven from the API line
+// ===================================================================================
+// gpu/d3d_draw.cpp walks the packets the title's own draw flush emits (into a private
+// scratch, never the ring) and hands each draw here with ITS register file and shader
+// hashes, instead of this module reading pm4.cpp's globals. Exactly one of the two
+// feeds can be live in a run: CZ_VKDRAW=1 activates the PM4 feed and makes these
+// no-ops; CZ_D3D_DRAW=1 activates these and makes VkRenderer_Draw/OnSwap no-ops. The
+// mutual exclusion is enforced at init, loudly — two feeds into one EDRAM image is a
+// collision, not an arm.
+struct Pm4ShaderBinding;
+
+bool VkRenderer_D3DInit();
+void VkRenderer_D3DDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
+                        const Pm4ShaderBinding& vs, const Pm4ShaderBinding& ps);
+// Present the accumulated frame. The front buffer is the last resolve's destination —
+// at the API line the PreSwapResolve immediately before every Swap names it, so no
+// side channel is needed.
+void VkRenderer_D3DSwap(uint8_t* base);

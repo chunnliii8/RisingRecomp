@@ -7268,7 +7268,7 @@ void ChooseEdramDepthFormat(VkPhysicalDevice phys)
     if (EnvOn("CZ_VK_DEPTH_FLOAT"))
     {
         g_edramDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
-        fprintf(stderr, "[vk] ED×7Û½›Ê×¬¢h­µçX\™H›İˆËÈLÌŒ[ˆ\È]H[™ML\\[™Hœ˜[YIÜÈš\œİ[BˆËÈ
+        fprintf(stderr, "[vk] ED×9Û›Ê×¬¢h­µçX\™H›İˆËÈLÌŒ[ˆ\È]H[™ML\\[™Hœ˜[YIÜÈš\œİ[BˆËÈ
 ØÚ\ÜÛÜˆ]HÜšYÚ[‹ÙˆLÚYJH\ÚÜÈ\È]Y\İ[ÛˆÙˆ[BˆËÈ]™\Hœ˜[YK‚ˆYˆ
 Z[İ
 [JHHZ[İ

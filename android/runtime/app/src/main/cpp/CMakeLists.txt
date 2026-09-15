@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(RisingRecompRuntimeBootstrap LANGUAGES CXX)
 
-add_library(rising_runtime_bootstrap SHARED runtime_bootstrap.cpp)
+add_library(rising_runtime_bootstrap SHARED runtime_bootstrap.cpp stfs_intake.cpp)
 target_compile_features(rising_runtime_bootstrap PRIVATE cxx_std_20)
 target_link_libraries(rising_runtime_bootstrap PRIVATE android log vulkan)

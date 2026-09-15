@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <unistd.h>
 
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -11,6 +12,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include "stfs_intake.h"
 
 namespace {
 
@@ -239,5 +242,25 @@ Java_com_risingrecomp_runtime_MainActivity_nativeStart(JNIEnv* env, jclass, jobj
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_risingrecomp_runtime_MainActivity_nativeStop(JNIEnv* env, jclass) {
     const std::string status = Stop();
+    return env->NewStringUTF(status.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_risingrecomp_runtime_MainActivity_nativeInspectPackage(
+        JNIEnv* env, jclass, jint fd, jstring xexPath, jstring manifestPath) {
+    const char* xexChars = env->GetStringUTFChars(xexPath, nullptr);
+    if (xexChars == nullptr) {
+        close(fd);
+        return nullptr;
+    }
+    const char* manifestChars = env->GetStringUTFChars(manifestPath, nullptr);
+    if (manifestChars == nullptr) {
+        env->ReleaseStringUTFChars(xexPath, xexChars);
+        close(fd);
+        return nullptr;
+    }
+    const std::string status = InspectCaseZeroPackage(fd, xexChars, manifestChars);
+    env->ReleaseStringUTFChars(manifestPath, manifestChars);
+    env->ReleaseStringUTFChars(xexPath, xexChars);
     return env->NewStringUTF(status.c_str());
 }

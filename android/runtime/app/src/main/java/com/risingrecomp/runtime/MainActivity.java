@@ -19,8 +19,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -42,24 +40,28 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private String runtimeReport = "Waiting for Android surface…\n";
     private String intakeReport = "No XBLA package selected.\n";
     private File privateXex;
-    private File privateManifest;
+
+    private interface InstallProgress {
+        void onProgress(long completed, long total);
+    }
 
     private static native String nativeStart(Object surface);
     private static native String nativeStop();
-    private static native String nativeInspectPackage(int fd, String xexPath,
-                                                       String manifestPath);
+    private static native String nativeInspectPackage(int fd, String installPath,
+                                                       InstallProgress progress);
+    private static native boolean nativeIsGameInstalled(String installPath);
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         File intakeDirectory = new File(getFilesDir(), "game-intake");
-        if (!intakeDirectory.exists() && !intakeDirectory.mkdirs()) {
-            Toast.makeText(this, "Falha ao criar armazenamento privado", Toast.LENGTH_LONG).show();
-        }
         privateXex = new File(intakeDirectory, "default.xex");
-        privateManifest = new File(intakeDirectory, "package-manifest.txt");
         buildInterface();
-        exportXex.setEnabled(false);
+        boolean installed = nativeIsGameInstalled(intakeDirectory.getAbsolutePath());
+        exportXex.setEnabled(installed);
+        if (installed)
+            intakeReport = "[XBLA intake]\nPersistent Case Zero install: READY\n" +
+                    "Source XBLA is no longer required.\n";
     }
 
     private int dp(int value) {
@@ -151,19 +153,14 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                          getContentResolver().openFileDescriptor(uri, "r")) {
                 if (descriptor == null)
                     throw new IllegalStateException("document provider returned no file");
-                if (privateXex.exists() && !privateXex.delete())
-                    throw new IllegalStateException("cannot replace previous private XEX");
                 int fd = descriptor.detachFd();
-                result = nativeInspectPackage(fd, privateXex.getAbsolutePath(),
-                        privateManifest.getAbsolutePath());
-                if (result.contains("INTAKE_STATUS: PASS")) {
-                    String sha256 = sha256(privateXex);
-                    result += "default.xex SHA-256: " + sha256 + "\n";
-                    try (FileOutputStream manifest = new FileOutputStream(privateManifest, true)) {
-                        manifest.write(("\ndefault_xex_sha256=" + sha256 + "\n")
-                                .getBytes(StandardCharsets.UTF_8));
-                    }
-                }
+                File installRoot = privateXex.getParentFile();
+                result = nativeInspectPackage(fd, installRoot.getAbsolutePath(),
+                        (completed, total) -> runOnUiThread(() -> {
+                            int percent = total == 0 ? 0 : (int) (completed * 100 / total);
+                            intakeReport = "[XBLA install]\nInstalling: " + percent + "%\n";
+                            showReports();
+                        }));
             } catch (Exception error) {
                 result = "[XBLA intake]\nINTAKE_STATUS: FAIL\nReason: " +
                         error.getMessage() + "\n";
@@ -179,18 +176,6 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                         Toast.LENGTH_LONG).show();
             });
         });
-    }
-
-    private static String sha256(File file) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] buffer = new byte[64 * 1024];
-        try (FileInputStream input = new FileInputStream(file)) {
-            int count;
-            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
-        }
-        StringBuilder value = new StringBuilder(64);
-        for (byte item : digest.digest()) value.append(String.format("%02x", item & 0xff));
-        return value.toString();
     }
 
     private void exportDefaultXex() {

@@ -14,6 +14,9 @@
 #include <vector>
 
 #include "stfs_intake.h"
+#ifdef CZ_LINKED_PPC_IMAGE
+#include "ppc_image_bridge.h"
+#endif
 
 namespace {
 
@@ -136,6 +139,11 @@ std::string Start(JNIEnv* env, jobject surface) {
     g_session.Destroy();
     std::ostringstream out;
     out << "RisingRecomp Android runtime bootstrap 0.1.0\n";
+#ifdef CZ_LINKED_PPC_IMAGE
+    out << ValidateLinkedPpcImage();
+#else
+    out << "PPC image: not linked (public bootstrap build)\n";
+#endif
     out << "Game data: not loaded (Stage 3 owns intake)\n";
 
     g_session.window = ANativeWindow_fromSurface(env, surface);
@@ -247,20 +255,33 @@ Java_com_risingrecomp_runtime_MainActivity_nativeStop(JNIEnv* env, jclass) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_risingrecomp_runtime_MainActivity_nativeInspectPackage(
-        JNIEnv* env, jclass, jint fd, jstring xexPath, jstring manifestPath) {
-    const char* xexChars = env->GetStringUTFChars(xexPath, nullptr);
-    if (xexChars == nullptr) {
+        JNIEnv* env, jclass, jint fd, jstring installPath, jobject callback) {
+    const char* installChars = env->GetStringUTFChars(installPath, nullptr);
+    if (installChars == nullptr) {
         close(fd);
         return nullptr;
     }
-    const char* manifestChars = env->GetStringUTFChars(manifestPath, nullptr);
-    if (manifestChars == nullptr) {
-        env->ReleaseStringUTFChars(xexPath, xexChars);
-        close(fd);
-        return nullptr;
+    jmethodID progressMethod = nullptr;
+    if (callback != nullptr) {
+        jclass callbackClass = env->GetObjectClass(callback);
+        progressMethod = env->GetMethodID(callbackClass, "onProgress", "(JJ)V");
+        env->DeleteLocalRef(callbackClass);
     }
-    const std::string status = InspectCaseZeroPackage(fd, xexChars, manifestChars);
-    env->ReleaseStringUTFChars(manifestPath, manifestChars);
-    env->ReleaseStringUTFChars(xexPath, xexChars);
+    const auto progress = [env, callback, progressMethod](uint64_t completed, uint64_t total) {
+        if (callback != nullptr && progressMethod != nullptr)
+            env->CallVoidMethod(callback, progressMethod, jlong(completed), jlong(total));
+    };
+    const std::string status = InstallCaseZeroPackage(fd, installChars, progress);
+    env->ReleaseStringUTFChars(installPath, installChars);
     return env->NewStringUTF(status.c_str());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_risingrecomp_runtime_MainActivity_nativeIsGameInstalled(
+        JNIEnv* env, jclass, jstring installPath) {
+    const char* installChars = env->GetStringUTFChars(installPath, nullptr);
+    if (installChars == nullptr) return JNI_FALSE;
+    const bool installed = IsCaseZeroInstalled(installChars);
+    env->ReleaseStringUTFChars(installPath, installChars);
+    return installed ? JNI_TRUE : JNI_FALSE;
 }
